@@ -1,0 +1,162 @@
+name: CI
+
+'on':
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_REPO: mirrorvol
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  check:
+    name: Format, lint, build, unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: cargo check / clippy / fmt --check
+        run: task check:all
+
+      - name: cargo build --workspace
+        run: task build
+
+      - name: cargo test --workspace (unit tests only — #[ignore]d integration tests skipped)
+        run: task test:unit
+
+  build-images:
+    name: Build ${{ matrix.target }} image
+    needs: check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - controller
+          - agent
+          - csi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build (host platform only) and export to a tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          tags: ${{ env.IMAGE_REPO }}/${{ matrix.target }}:${{ env.IMAGE_TAG }}
+          outputs: type=docker,dest=/tmp/${{ matrix.target }}.tar
+          cache-from: type=gha,scope=build-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ matrix.target }}
+          path: /tmp/${{ matrix.target }}.tar
+          retention-days: 1
+
+  integration:
+    name: Integration + e2e + CSI tests (KinD)
+    needs: build-images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.31.0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: docker-image-*
+          path: /tmp/images
+          merge-multiple: true
+
+      - name: docker load the images build-images already built
+        run: |
+          for tar in /tmp/images/*.tar; do
+            docker load -i "$tar"
+          done
+
+      - name: task test:integration:full
+        run: task test:integration:full
+
+  publish:
+    name: Publish ${{ matrix.target }} image
+    needs: build-images
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - controller
+          - agent
+          - csi
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase image name
+        id: image
+        run: echo "name=$(echo 'ghcr.io/${{ github.repository_owner }}/mirrorvol' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push ${{ matrix.target }} (multi-arch)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: ${{ matrix.target }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}/${{ matrix.target }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}/${{ matrix.target }}:latest
+          cache-from: type=gha,scope=build-${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.target }}

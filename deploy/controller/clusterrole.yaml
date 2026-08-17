@@ -1,0 +1,57 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mirrorvol-controller
+rules:
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - mirroredvolumes
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - mirroredvolumes/status
+    verbs:
+  - "get"
+  - "patch"
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - backendnodes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+  - apiGroups:
+    - apps
+    resources:
+      - deployments
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+  # patch_scale (KubeAppScaler::scale) goes through the Scale subresource,
+  # which RBAC gates separately from the Deployment object itself.
+  - apiGroups:
+    - apps
+    resources:
+      - deployments/scale
+    verbs:
+  - "get"
+  - "patch"

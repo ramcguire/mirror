@@ -1,0 +1,22 @@
+[package]
+name = "mirrorvol-backend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The LocalBackend trait plus its implementations (Syncthing today, in the syncthing module) and an in-memory FakeBackend for testing the controller and agent without a real backend."
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
+walkdir = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = { workspace = true }
+tempfile = { workspace = true }

@@ -1,0 +1,92 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mirrorvol-agent
+rules:
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - mirroredvolumes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - mirroredvolumes/status
+    verbs:
+  - "get"
+  - "patch"
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - backendnodes
+    verbs:
+  - "get"
+  - "list"
+  - "watch"
+  - "create"
+  - "patch"
+  - apiGroups:
+    - homelab.internal
+    resources:
+      - backendnodes/status
+    verbs:
+      - get
+      - patch
+  - apiGroups:
+    - ""
+    resources:
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+      - patch
+  - apiGroups:
+    - ""
+    resources:
+      - nodes/proxy
+    verbs:
+      - get
+  - apiGroups:
+    - ""
+    resources:
+      - nodes
+    verbs:
+  - "get"
+  - apiGroups:
+    - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+      - create
+      - patch
+  - apiGroups:
+    - ""
+    resources:
+      - services
+    verbs:
+      - get
+      - create
+      - patch
+  - apiGroups:
+    - apps
+    resources:
+      - deployments
+    verbs:
+  - "get"
+  - apiGroups:
+    - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+  - apiGroups:
+    - ""
+    resources:
+      - persistentvolumes
+    verbs:
+      - get

@@ -1,0 +1,354 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: mirroredvolumes.homelab.internal
+spec:
+  group: homelab.internal
+  names:
+    categories: []
+    kind: MirroredVolume
+    plural: mirroredvolumes
+    shortNames: []
+    singular: mirroredvolume
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.operation.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.active.node
+      name: Active
+      type: string
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for MirroredVolumeSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              backend:
+                default: syncthing
+                description: Which backend gates this volume's promotion — `mirrorvol-agent` reconciles against it, and admission requires every candidate node to have a `BackendNode` advertising it.
+                type: string
+              candidateNodes:
+                description: Nodes eligible to hold a replica.
+                items:
+                  type: string
+                type: array
+              consistency:
+                default: bestEffort
+                description: '`bestEffort` (default) or `strict`. Immutable after creation. Delete and recreate the `MirroredVolume` to change it.'
+                enum:
+                - bestEffort
+                - strict
+                type: string
+                x-kubernetes-validations:
+                - message: consistency is immutable; delete and recreate the MirroredVolume to change it
+                  rule: self == oldSelf
+              desiredActiveNode:
+                description: Human-authored desired writer. The controller snapshots this into an immutable operation before taking any disruptive action.
+                type: string
+              operationTimeoutSeconds:
+                default: 900
+                description: How long an operation may run before the controller gives up and moves the volume to `Degraded`.
+                format: uint64
+                minimum: 0.0
+                type: integer
+              storage:
+                description: The local-storage claims used for the candidate replicas.
+                properties:
+                  claimTemplate:
+                    x-kubernetes-preserve-unknown-fields: true
+                  ignorePatterns:
+                    default: []
+                    description: Gitignore-style patterns applied identically on every candidate. Files these patterns match should never be synced in either direction.
+                    items:
+                      type: string
+                    type: array
+                  pullOnly:
+                    default: false
+                    description: '`bestEffort` only, off by default: once the active node''s replica is observed healthy, every other candidate''s folder is patched to `Receive Only` as hygiene against accidental concurrent writes.'
+                    type: boolean
+                  replicaPathTemplate:
+                    description: Local-provisioner adapter path with `{claim}` substituted by the deterministic candidate claim name.
+                    type: string
+                  storageClassName:
+                    type: string
+                required:
+                - claimTemplate
+                - replicaPathTemplate
+                - storageClassName
+                type: object
+              workload:
+                description: The single-replica workload whose named PVC-backed volume is managed.
+                properties:
+                  kind:
+                    type: string
+                  mountPath:
+                    type: string
+                  name:
+                    type: string
+                  volumeName:
+                    type: string
+                required:
+                - kind
+                - mountPath
+                - name
+                - volumeName
+                type: object
+            required:
+            - candidateNodes
+            - desiredActiveNode
+            - storage
+            - workload
+            type: object
+          status:
+            nullable: true
+            properties:
+              active:
+                nullable: true
+                properties:
+                  epoch:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  node:
+                    type: string
+                required:
+                - epoch
+                - node
+                type: object
+              conditions:
+                default: []
+                items:
+                  description: Condition contains details for one aspect of the current state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: message is a human readable message indicating details about the transition. This may be an empty string.
+                      type: string
+                    observedGeneration:
+                      description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                      format: int64
+                      type: integer
+                    reason:
+                      description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+              grant:
+                nullable: true
+                properties:
+                  epoch:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  operationId:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  target:
+                    type: string
+                required:
+                - epoch
+                - operationId
+                - target
+                type: object
+              nodeIdentityGenerations:
+                additionalProperties:
+                  format: uint64
+                  minimum: 0.0
+                  type: integer
+                default: {}
+                description: Identity generation the controller has last acknowledged per candidate node. A mismatch against `BackendNode.status.identityGeneration` is what `mirrorvol_controller::decide` treats as a contradiction. Set on first sighting of a node; never auto-updated after that.
+                type: object
+              nodes:
+                additionalProperties:
+                  properties:
+                    conflictFiles:
+                      default: []
+                      description: '`bestEffort` only: unresolved `*.sync-conflict-*` paths this node''s backend currently reports for its own replica. The controller aggregates these across candidates into a `Degraded`/`SyncConflict` status condition — informational only, never a gate.'
+                      items:
+                        type: string
+                      type: array
+                    detail:
+                      x-kubernetes-preserve-unknown-fields: true
+                    epoch:
+                      description: The writer epoch when `role == Writer`.
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    lockAbsent:
+                      description: Local view of the synchronized writer lock.
+                      type: boolean
+                    lockEpoch:
+                      description: Epoch read from a present lock.
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    quiescedOperation:
+                      description: This source node has proved workload and mount teardown.
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    ready:
+                      description: Local replica completion, never a cached remote completion result.
+                      type: boolean
+                    releaseObservedOperation:
+                      description: This target saw the operation's release in its own local replica.
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    releasedOperation:
+                      description: This source node removed its lock for the operation.
+                      format: uint64
+                      minimum: 0.0
+                      nullable: true
+                      type: integer
+                    role:
+                      description: The locally observed backend role — one of `role::WRITER`/ `role::STANDBY`.
+                      type: string
+                    writerPodUids:
+                      default: []
+                      description: Writer Pod UIDs recently observed locally. Used to prove that a force-deleted writer process is no longer running before lock release.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - lockAbsent
+                  - ready
+                  - role
+                  type: object
+                default: {}
+                type: object
+              operation:
+                nullable: true
+                properties:
+                  deadline:
+                    type: string
+                  epoch:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  id:
+                    format: uint64
+                    minimum: 0.0
+                    type: integer
+                  phase:
+                    type: string
+                  source:
+                    nullable: true
+                    type: string
+                  startedAt:
+                    type: string
+                  target:
+                    type: string
+                required:
+                - deadline
+                - epoch
+                - id
+                - phase
+                - startedAt
+                - target
+                type: object
+            type: object
+        required:
+        - spec
+        title: MirroredVolume
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: backendnodes.homelab.internal
+spec:
+  group: homelab.internal
+  names:
+    categories: []
+    kind: BackendNode
+    plural: backendnodes
+    shortNames: []
+    singular: backendnode
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.node
+      name: Node
+      type: string
+    - jsonPath: .spec.backend
+      name: Backend
+      type: string
+    - jsonPath: .status.healthy
+      name: Healthy
+      type: boolean
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BackendNodeSpec via `CustomResource`
+        properties:
+          spec:
+            description: 'One per (node, backend type): a node can run more than one backend for the same volume. Created and owned entirely by that node''s agent on boot. Read-only to the controller and every other consumer.'
+            properties:
+              backend:
+                description: Only `backend::SYNCTHING` (`"syncthing"`) for now.
+                type: string
+              node:
+                type: string
+            required:
+            - backend
+            - node
+            type: object
+          status:
+            nullable: true
+            properties:
+              detail:
+                x-kubernetes-preserve-unknown-fields: true
+              deviceCertSource:
+                description: 'Which device-cert path this node''s agent is running: `"cert-manager"` (attested, not implemented yet) or `"self-managed"` (today''s TOFU cert — the only value currently written).'
+                nullable: true
+                type: string
+              deviceId:
+                description: Stable local backend identity, e.g. a Syncthing device ID.
+                nullable: true
+                type: string
+              healthy:
+                default: false
+                type: boolean
+              identityGeneration:
+                default: 0
+                description: Changes only after explicit backend identity re-enrollment.
+                format: uint64
+                minimum: 0.0
+                type: integer
+            type: object
+        required:
+        - spec
+        title: BackendNode
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

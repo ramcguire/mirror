@@ -1,0 +1,321 @@
+# yaml-language-server: $schema=https://taskfile.dev/schema.json
+version: "3"
+
+vars:
+  CLUSTER_NAME: mirrorvol
+  KIND_CONFIG: "{{.ROOT_DIR}}/kind/kind-config.yaml"
+  KIND_KUBECONFIG: "{{.ROOT_DIR}}/.kind/kubeconfig"
+  CRD_FILE: "{{.ROOT_DIR}}/deploy/crds/mirroredvolume.yaml"
+  IMAGE_BUILDER: mirrorvol-image-builder
+  IMAGE_PLATFORMS: linux/amd64,linux/arm64
+  IMAGE_REPO: mirrorvol
+  IMAGE_TAG: dev
+
+env:
+  # Every task in this file inherits this to isolate KinD runs from any host kubeconfig
+  KUBECONFIG: "{{.KIND_KUBECONFIG}}"
+
+tasks:
+  default:
+    desc: List available tasks.
+    silent: true
+    cmds:
+      - task --list
+
+  lint:
+    desc: cargo clippy across the whole workspace, including tests.
+    cmd: cargo clippy --workspace --all-targets
+  format:
+    desc: Run formatting checks.
+    aliases: [fmt]
+    cmd: cargo fmt
+  format:check:
+    desc: Run formatting checks (dry run).
+    aliases: ['fmt:check']
+    cmd: cargo fmt --check
+  build:
+    desc: Build the mirrorvol binary.
+    cmd: cargo build --all {{.BUILD_ARGS}}
+  check:
+    desc: Cargo check
+    cmd: cargo check --workspace --all-targets
+  check:all:
+    desc: Run checks (lint, format, generated-CRD drift).
+    cmds:
+      - task: check
+      - task: lint
+      - task: format:check
+      - task: crds:check
+
+  tools:check:
+    desc: Verify kind/kubectl/docker/cargo are on PATH before anything else fails confusingly.
+    silent: true
+    cmds:
+      - |
+        missing=""
+        for bin in kind kubectl docker cargo; do
+          command -v "$bin" >/dev/null 2>&1 || missing="$missing $bin"
+        done
+        if [ -n "$missing" ]; then
+          echo "missing required tool(s):$missing" >&2
+          exit 1
+        fi
+
+  cluster:up:
+    desc: Create the mirrorvol KinD cluster (no-op if it already exists).
+    deps: [tools:check]
+    status:
+      - kind get clusters | grep -qx "{{.CLUSTER_NAME}}"
+    cmds:
+      - mkdir -p "{{.ROOT_DIR}}/.kind"
+      - kind create cluster --name {{.CLUSTER_NAME}} --config "{{.KIND_CONFIG}}" --kubeconfig "{{.KIND_KUBECONFIG}}"
+      - task: cluster:wait-ready
+
+  cluster:wait-ready:
+    desc: Block until every node is Ready (used by cluster:up; safe to run standalone).
+    internal: true
+    cmds:
+      - kubectl wait --for=condition=Ready nodes --all --timeout=120s
+
+  cluster:down:
+    desc: Delete the mirrorvol KinD cluster and its isolated kubeconfig.
+    aliases: [down]
+    cmds:
+      - kind delete cluster --name {{.CLUSTER_NAME}}
+      - rm -f "{{.KIND_KUBECONFIG}}"
+
+  cluster:recreate:
+    desc: Tear down and recreate the cluster from scratch.
+    cmds:
+      - task: cluster:down
+      - task: cluster:up
+
+  cluster:kubeconfig-path:
+    desc: Print the isolated kubeconfig path (for `export KUBECONFIG=$(task -s cluster:kubeconfig-path)`).
+    silent: true
+    cmds:
+      - echo "{{.KIND_KUBECONFIG}}"
+
+  cluster:info:
+    desc: kubectl cluster-info + kind's own view of which clusters exist.
+    cmds:
+      - kubectl cluster-info
+      - echo "---"
+      - kind get clusters
+
+  cluster:nodes:
+    desc: List nodes with the mirrorvol.io/candidate label visible.
+    cmds:
+      - kubectl get nodes -o wide --show-labels
+
+  cluster:events:
+    desc: Cluster-wide events, most recent last — first place to look when something didn't reconcile.
+    cmds:
+      - kubectl get events -A --sort-by=.lastTimestamp
+
+  cluster:get:
+    desc: 'kubectl get any resource cluster-wide, e.g. `task cluster:get -- mirroredvolumes -A`.'
+    cmds:
+      - kubectl get {{.CLI_ARGS}}
+
+  cluster:describe:
+    desc: 'kubectl describe, e.g. `task cluster:describe -- mirroredvolume example-app-config -n itest-crd-123-0`.'
+    cmds:
+      - kubectl describe {{.CLI_ARGS}}
+
+  cluster:logs:
+    desc: 'kubectl logs, e.g. `task cluster:logs -- -n mirrorvol ds/mirrorvol-syncthing -f`.'
+    cmds:
+      - kubectl logs {{.CLI_ARGS}}
+
+  cluster:shell:
+    desc: 'Open a shell in one of the KinD node containers, e.g. `task cluster:shell -- mirrorvol-worker`.'
+    cmds:
+      - docker exec -it {{.CLI_ARGS | default (printf "%s-control-plane" .CLUSTER_NAME)}} bash
+
+  crds:generate:
+    desc: Regenerate deploy/crds/mirroredvolume.yaml (both CRDs) from the Rust types.
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo run --quiet --bin crdgen > "{{.CRD_FILE}}"
+
+  crds:apply:
+    desc: Apply the (already generated) CRDs to the KinD cluster.
+    deps: [cluster:up]
+    cmds:
+      - kubectl apply -f "{{.CRD_FILE}}"
+      - kubectl wait --for=condition=Established crd/mirroredvolumes.homelab.internal --timeout=30s
+      - kubectl wait --for=condition=Established crd/backendnodes.homelab.internal --timeout=30s
+
+  crds:sync:
+    desc: Regenerate and apply the CRDs in one step — what you want after changing mirrorvol-api.
+    cmds:
+      - task: crds:generate
+      - task: crds:apply
+
+  crds:check:
+    desc: Fail if the committed deploy/crds/mirroredvolume.yaml is stale relative to the Rust CRD types — what check:all/CI runs. Run `task crds:generate` and commit the result to fix.
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo run --quiet --bin crdgen -- --check "{{.CRD_FILE}}"
+
+  deploy:apply:
+    desc: Apply the full kustomization (namespace, controller, agent+DaemonSet, CRDs) to the KinD cluster.
+    deps: [cluster:up]
+    cmds:
+      - kubectl apply -k "{{.ROOT_DIR}}/deploy/"
+
+  rbac:apply:
+    desc: Apply just the namespace/ServiceAccount/ClusterRole/ClusterRoleBinding objects (rbac related only).
+    deps: [cluster:up]
+    cmds:
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/syncthing/namespace.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/controller/serviceaccount.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/controller/clusterrole.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/controller/clusterrolebinding.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/agent/serviceaccount.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/agent/clusterrole.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/agent/clusterrolebinding.yaml"
+
+  deploy:full:
+    desc: Build+load real images, apply the full kustomization, and wait for it to roll out.
+    deps: [cluster:up]
+    cmds:
+      - task: kind:load
+      - kubectl apply -k "{{.ROOT_DIR}}/deploy/"
+      - kubectl -n mirrorvol rollout restart daemonset/mirrorvol-syncthing
+      - kubectl -n mirrorvol rollout restart deployment/mirrorvol-controller
+      - kubectl -n mirrorvol rollout status daemonset/mirrorvol-syncthing --timeout=180s
+      - kubectl -n mirrorvol rollout status deployment/mirrorvol-controller --timeout=60s
+
+  csi:install-test-driver:
+    desc: >-
+      Install the sig-storage csi-driver-host-path reference plugin as the
+      underlying driver mirrorvol-csi wraps in test:csi.
+    deps: [deploy:full]
+    cmds:
+      - kubectl apply -f "{{.ROOT_DIR}}/deploy/csi/host-path-driver.yaml"
+      - kubectl -n mirrorvol rollout status daemonset/csi-hostpath-test-driver --timeout=120s
+
+  image:builder:up:
+    desc: Create the docker-container buildx builder multi-platform output needs (no-op if it already exists).
+    internal: true
+    status:
+      - docker buildx inspect {{.IMAGE_BUILDER}} >/dev/null 2>&1
+    cmds:
+      - docker buildx create --name {{.IMAGE_BUILDER}} --driver docker-container --bootstrap
+
+  image:builder:down:
+    desc: Remove the docker-container buildx builder.
+    if: docker buildx inspect {{.IMAGE_BUILDER}} >/dev/null 2>&1
+    cmd: docker buildx rm {{.IMAGE_BUILDER}}
+
+  image:build:controller:
+    desc: 'Build the controller image for your host platform only, loaded into the local docker daemon (for `task kind:load`). Fast path for local iteration.'
+    dir: "{{.ROOT_DIR}}"
+    deps: [image:builder:up]
+    status:
+      - docker image inspect {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} >/dev/null 2>&1
+    cmds:
+      - docker buildx build --target controller --load -t {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} .
+
+  image:build:agent:
+    desc: 'Build the agent image for your host platform only, loaded into the local docker daemon. See image:build:controller.'
+    deps: [image:builder:up]
+    dir: "{{.ROOT_DIR}}"
+    status:
+      - docker image inspect {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} >/dev/null 2>&1
+    cmds:
+      - docker buildx build --target agent --load -t {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} .
+
+  image:build:csi:
+    desc: 'Build the mirrorvol-csi image for your host platform only, loaded into the local docker daemon. See image:build:controller.'
+    deps: [image:builder:up]
+    dir: "{{.ROOT_DIR}}"
+    status:
+      - docker image inspect {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} >/dev/null 2>&1
+    cmds:
+      - docker buildx build --target csi --load -t {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} .
+
+  image:build:
+    desc: Build all three images, host-platform-only, loaded locally. What you want during day-to-day development.
+    deps: [image:builder:up]
+    cmds:
+      - defer: { task: 'image:builder:down' }
+      - task: image:build:controller
+      - task: image:build:agent
+      - task: image:build:csi
+
+  image:push:
+    desc: 'Multi-arch build+push of all three images (IMAGE_PLATFORMS, default linux/amd64,linux/arm64) to IMAGE_REPO. Requires a real registry.'
+    deps: [image:builder:up]
+    dir: "{{.ROOT_DIR}}"
+    requires:
+      vars:
+        - IMAGE_REPO
+        - IMAGE_TAG
+    cmds:
+      - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target controller -t {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} --push .
+      - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target agent -t {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} --push .
+      - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target csi -t {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} --push .
+
+  kind:load:
+    desc: Build all three images locally and load them straight into the KinD cluster's image store.
+    deps: [cluster:up, image:build]
+    cmds:
+      - kind load docker-image {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
+      - kind load docker-image {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
+      - kind load docker-image {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
+
+  test:unit:
+    desc: Fast, cluster-free unit tests (what CI should run on every push).
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo test --workspace
+
+  test:integration:
+    desc: >-
+      Run the fast, real-cluster tests against an already
+      running KinD cluster. Doesn't need images or a full deploy.
+    deps: [crds:sync]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - task: rbac:apply
+      - cargo test -p mirrorvol-itest --test integration --test rbac --test syncthing_backend -- --ignored --test-threads=1 --nocapture
+
+  test:e2e:
+    desc: >-
+        Full e2e test suite: full_promotion_cycle, full_promotion_cycle_best_effort, reconciliation_conditions.
+    deps: [csi:install-test-driver]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo test -p mirrorvol-itest --test full_promotion_cycle --test full_promotion_cycle_best_effort --test reconciliation_conditions -- --ignored --test-threads=1 --nocapture
+
+  test:csi:
+    desc: Install csi-driver-host-path as a driver, create a PVC, and confirm delegation + the Syncthing attach hook actually ran.
+    deps: [csi:install-test-driver]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo test -p mirrorvol-itest --test csi_overlay -- --ignored --test-threads=1 --nocapture
+
+  test:integration:full:
+    desc: 'Full ephemeral cycle: create a fresh cluster, run integration + e2e + CSI tests, tear down.'
+    cmds:
+      - task: cluster:recreate
+      - task: crds:sync
+      - task: test:integration
+      - task: test:e2e
+      - task: test:csi
+      - task: cluster:down
+
+  test:all:
+    desc: Unit tests, then a full ephemeral integration-test cycle.
+    cmds:
+      - task: test:unit
+      - task: test:integration:full
+
+  dev:up:
+    desc: Bring up a cluster with the CRDs installed, ready to poke at with kubectl.
+    cmds:
+      - task: cluster:up
+      - task: crds:sync

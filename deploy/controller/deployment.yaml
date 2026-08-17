@@ -1,0 +1,33 @@
+# The controller half of the deployment topology: a single-replica
+# Deployment that never talks to a backend directly; only reads
+# MirroredVolume/BackendNode and writes MirroredVolume status + the app
+# Deployment's scale/nodeSelector.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mirrorvol-controller
+  namespace: mirrorvol
+  labels:
+    app.kubernetes.io/name: mirrorvol-controller
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mirrorvol-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mirrorvol-controller
+    spec:
+      serviceAccountName: mirrorvol-controller
+      containers:
+        - name: controller
+          # Built by `task image:build:controller` / pushed by `task
+          # image:push` — see the Dockerfile and Taskfile.yml's image:*
+          # tasks. Tag matches IMAGE_REPO/IMAGE_TAG's defaults so `task
+          # kind:load` + this manifest agree without extra overrides.
+          image: mirrorvol/controller:dev
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: RUST_LOG
+              value: info

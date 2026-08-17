@@ -1,0 +1,15 @@
+resources:
+  - crds/mirroredvolume.yaml
+  - syncthing/namespace.yaml
+  - controller/serviceaccount.yaml
+  - controller/clusterrole.yaml
+  - controller/clusterrolebinding.yaml
+  - controller/deployment.yaml
+  - agent/serviceaccount.yaml
+  - agent/clusterrole.yaml
+  - agent/clusterrolebinding.yaml
+  - csi/clusterrole.yaml
+  - csi/clusterrolebinding.yaml
+  - csi/csidriver.yaml
+  - csi/storageclass.yaml
+  - syncthing/daemonset.yaml

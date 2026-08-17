@@ -1,0 +1,19 @@
+/target
+**/target
+
+.kind
+
+/deploy
+/kind
+*.md
+/.git
+/.gitignore
+Taskfile.yml
+
+# Editor/OS noise.
+.vscode
+.config
+.idea
+**/*.rs.bk
+.DS_Store
+.claude

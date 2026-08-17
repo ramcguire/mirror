@@ -1,0 +1,31 @@
+[package]
+name = "mirrorvol-csi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "CSI overlay driver: wraps an existing node-local CSI driver and attaches a mirrorvol backend once its delegated NodeStageVolume succeeds"
+
+[[bin]]
+name = "mirrorvol-csi"
+path = "src/main.rs"
+
+[dependencies]
+mirrorvol-api = { workspace = true }
+mirrorvol-backend = { workspace = true }
+tokio = { workspace = true, features = ["net", "signal"] }
+tokio-stream = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tower = { workspace = true }
+hyper-util = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

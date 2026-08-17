@@ -1,0 +1,74 @@
+# The standard external-provisioner ClusterRole (see
+# https://github.com/kubernetes-csi/external-provisioner/blob/v6.3.0/deploy/kubernetes/rbac.yaml),
+# trimmed to what --node-deployment --leader-election=false actually
+# exercises: no snapshot rules (mirrorvol-csi's Controller returns
+# UNIMPLEMENTED for all snapshotting RPCs — see controller.rs), no
+# Role/RoleBinding for leader-election Leases (disabled — each node's
+# csi-provisioner instance only ever provisions for its own node, so
+# cross-instance leader election has nothing to arbitrate here).
+#
+# Bound to the existing mirrorvol-agent ServiceAccount (see
+# clusterrolebinding.yaml), not a separate one: the csi-provisioner sidecar
+# joins the same Pod as syncthing/mirrorvol-agent (syncthing/daemonset.yaml)
+# rather than a new DaemonSet, and a Pod can only run under one
+# ServiceAccount — see that file's own top-of-file comment for why this is
+# one Pod, not several.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mirrorvol-csi-provisioner
+rules:
+  - apiGroups:
+    - ""
+    resources:
+      - persistentvolumes
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - patch
+      - delete
+  - apiGroups:
+    - ""
+    resources:
+      - persistentvolumeclaims
+    verbs:
+      - get
+      - list
+      - watch
+      - update
+  - apiGroups:
+    - storage.k8s.io
+    resources:
+      - storageclasses
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - ""
+    resources:
+      - events
+    verbs:
+      - list
+      - watch
+      - create
+      - update
+      - patch
+  - apiGroups:
+    - storage.k8s.io
+    resources:
+      - csinodes
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+    - ""
+    resources:
+      - nodes
+    verbs:
+      - get
+      - list
+      - watch

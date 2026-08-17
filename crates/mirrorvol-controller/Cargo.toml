@@ -1,0 +1,33 @@
+[package]
+name = "mirrorvol-controller"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "The MirroredVolume reconciler plus a crdgen binary for exporting the CRD YAML consumed by kustomize."
+
+[[bin]]
+name = "mirrorvol-controller"
+path = "src/main.rs"
+
+[[bin]]
+name = "crdgen"
+path = "src/bin/crdgen.rs"
+
+[dependencies]
+# Deliberately no mirrorvol-backend dependency: the cluster-wide controller
+# never calls a backend directly — only mirrorvol-agent does.
+mirrorvol-api = { workspace = true }
+kube = { workspace = true }
+k8s-openapi = { workspace = true }
+chrono = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+anyhow = { workspace = true }

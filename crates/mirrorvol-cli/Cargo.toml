@@ -1,0 +1,17 @@
+[package]
+name = "mirrorvol-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Low-level troubleshooting tool: reads a local Syncthing instance's device ID."
+
+[dependencies]
+mirrorvol-backend = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
