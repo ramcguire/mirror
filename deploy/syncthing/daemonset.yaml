@@ -41,11 +41,23 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            # Enables provisioning the shared rsync module secret. Remove
+            # for a Syncthing-only deployment.
+            - name: RSYNC_SECRET_FILE
+              value: "/shared-rsync/secret"
+            # Enables provisioning this node's own rsync device identity
+            # token — distinct file from RSYNC_SECRET_FILE above: "are you
+            # allowed to connect" (shared) vs. "which device is this"
+            # (per-node).
+            - name: RSYNC_IDENTITY_FILE
+              value: "/shared-rsync/identity"
             - name: RUST_LOG
               value: info
           volumeMounts:
             - name: shared-apikey
               mountPath: /shared
+            - name: shared-rsync
+              mountPath: /shared-rsync
         - name: force-standby
           image: busybox:1.36
           command:
@@ -141,6 +153,17 @@ spec:
               value: "/shared-consistency"
             - name: MIRRORVOL_CONFLICT_DETECTION
               value: "filesystem"
+            # Enables the rsync backend; pulls always route through the
+            # stunnel sidecar below once this is set.
+            - name: RSYNC_SECRET_FILE
+              value: "/shared-rsync/secret"
+            # This node's own rsync device identity token, written by the
+            # provision initContainer above — used as BackendNode.status.deviceId
+            # instead of the node name.
+            - name: RSYNC_IDENTITY_FILE
+              value: "/shared-rsync/identity"
+            - name: RSYNC_DAEMON_CONFIG_FILE
+              value: "/etc/rsyncd.d/rsyncd.conf"
             - name: RUST_LOG
               value: info
           volumeMounts:
@@ -151,6 +174,64 @@ spec:
               readOnly: true
             - name: shared-consistency
               mountPath: /shared-consistency
+            - name: shared-rsync
+              mountPath: /shared-rsync
+            - name: rsyncd-conf
+              mountPath: /etc/rsyncd.d
+        # rsync daemon, loopback-only — stunnel below is the only reachable
+        # entry point. Waits for mirrorvol-agent to write the module list.
+        - name: rsyncd
+          image: mirrorvol/rsyncd:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - >-
+              until [ -f /etc/rsyncd.d/rsyncd.conf ]; do sleep 1; done;
+              exec rsync --daemon --no-detach --port=873 --address=127.0.0.1
+              --config=/etc/rsyncd.d/rsyncd.conf
+          # tcpSocket probes connect from the kubelet, outside the Pod's
+          # network namespace — they can never reach a loopback-only bind.
+          # exec runs inside the container itself instead.
+          readinessProbe:
+            exec:
+              command: ["nc", "-z", "127.0.0.1", "873"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: mirror-data
+              mountPath: /data
+              readOnly: true
+            - name: rsyncd-conf
+              mountPath: /etc/rsyncd.d
+              readOnly: true
+        # TLS-terminating sidecar in front of rsyncd — the only reachable
+        # rsync entry point. Authenticated by TLS-PSK, reusing rsyncd's own
+        # secret.psk file.
+        - name: stunnel
+          image: mirrorvol/rsyncd:dev
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -ec
+            - >-
+              until [ -f /shared-rsync/secret.psk ]; do sleep 1; done;
+              printf 'foreground = yes\npid =\n\n[mirrorvol]\naccept = 0.0.0.0:8873\nconnect = 127.0.0.1:873\nPSKsecrets = /shared-rsync/secret.psk\n'
+              > /tmp/stunnel.conf;
+              exec stunnel /tmp/stunnel.conf
+          ports:
+            - name: rsync-tls
+              containerPort: 8873
+              protocol: TCP
+          readinessProbe:
+            tcpSocket:
+              port: rsync-tls
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: shared-rsync
+              mountPath: /shared-rsync
+              readOnly: true
         # --- mirrorvol-csi overlay driver + its standard sidecars ---
         - name: mirrorvol-csi
           image: mirrorvol/csi:dev
@@ -168,6 +249,10 @@ spec:
             # Same _FILE fallback as the mirrorvol-agent container above
             - name: SYNCTHING_API_KEY_FILE
               value: "/shared/apikey"
+            # Used for the attach-time pull-verify; this container never
+            # runs rsyncd itself, so no RSYNC_DAEMON_CONFIG_FILE.
+            - name: RSYNC_SECRET_FILE
+              value: "/shared-rsync/secret"
             - name: MIRRORVOL_CONSISTENCY_DIR
               value: "/shared-consistency"
             - name: RUST_LOG
@@ -175,13 +260,36 @@ spec:
           volumeMounts:
             - name: csi-socket-dir
               mountPath: /csi
+            # Same real replica data mirrorvol-agent operates on (see that
+            # container's own mirror-data mount above) — node.rs's
+            # verify_local_writer needs to read the real lock file at
+            # whatever real path mirrorvol.io/resolvedPath names (typically
+            # /data/<id>) once underlyingPathTemplate resolved one; without
+            # this mount that path is simply empty/nonexistent from this
+            # container's own filesystem view, regardless of how correctly
+            # it was resolved.
+            - name: mirror-data
+              mountPath: /data
+              readOnly: true
             - name: shared-consistency
               mountPath: /shared-consistency
               readOnly: true
             - name: kubelet-plugins-dir
               mountPath: /var/lib/kubelet/plugins
+              # Without this, a bind-mount kubelet/the underlying driver
+              # creates *after* this Pod started (i.e. every real
+              # NodeStageVolume call for a volume attached later) never
+              # becomes visible inside this container — this hostPath mount
+              # would just show its empty pre-mount state. verify_local_writer's
+              # lock_state check (node.rs) reads real files under here (via
+              # the underlying driver's staging_target_path); without this,
+              # it always reads Absent regardless of the real on-disk state.
+              mountPropagation: HostToContainer
             - name: shared-apikey
               mountPath: /shared
+              readOnly: true
+            - name: shared-rsync
+              mountPath: /shared-rsync
               readOnly: true
         - name: node-driver-registrar
           image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.17.0
@@ -215,6 +323,10 @@ spec:
         - name: shared-apikey
           emptyDir: {}
         - name: shared-consistency
+          emptyDir: {}
+        - name: shared-rsync
+          emptyDir: {}
+        - name: rsyncd-conf
           emptyDir: {}
         - name: syncthing-config
           hostPath:

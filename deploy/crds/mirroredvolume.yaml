@@ -65,15 +65,23 @@ spec:
                     items:
                       type: string
                     type: array
-                  pullOnly:
-                    default: false
-                    description: '`bestEffort` only, off by default: once the active node''s replica is observed healthy, every other candidate''s folder is patched to `Receive Only` as hygiene against accidental concurrent writes.'
-                    type: boolean
                   replicaPathTemplate:
                     description: Local-provisioner adapter path with `{claim}` substituted by the deterministic candidate claim name.
                     type: string
                   storageClassName:
                     type: string
+                  warmSyncIntervalSeconds:
+                    default: 300
+                    description: '`backend: rsync` only: how often a standby candidate''s periodic warm sync pulls from the active node, keeping it warm ahead of any move. Independent of the gated final resync a `strict` promotion runs at `AwaitingRelease`/before `acquire_writer` (see `mirrorvol-backend::rsync`''s `completion`), which always runs a fresh full pass regardless of this interval. Ignored by every other backend. No volume has been measured yet, so this default (like `operationTimeoutSeconds`''s) is a starting guess, not a tuned value.'
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
+                  writerAgreementTimeoutSeconds:
+                    default: 1800
+                    description: '`bestEffort` only: how long `status.writerAgreement` may stay `Pending` (more than one candidate currently write-capable) before the controller surfaces a `Degraded`/`MultipleWriters` condition. Informational only — never gates, same as `SyncConflict`. `strict` reuses `operationTimeoutSeconds` for the analogous bound instead (its own `Pending` only ever exists inside a live, deadline-bound operation), so this field is ignored there. Bounded by how long a candidate''s *initial* full sync can legitimately take, which is unmeasured and data-size-dependent — same starting-guess caveat as `operationTimeoutSeconds`/`warmSyncIntervalSeconds`.'
+                    format: uint32
+                    minimum: 0.0
+                    type: integer
                 required:
                 - claimTemplate
                 - replicaPathTemplate
@@ -177,6 +185,24 @@ spec:
                 default: {}
                 description: Identity generation the controller has last acknowledged per candidate node. A mismatch against `BackendNode.status.identityGeneration` is what `mirrorvol_controller::decide` treats as a contradiction. Set on first sighting of a node; never auto-updated after that.
                 type: object
+              nodeWriterAgreement:
+                additionalProperties:
+                  description: One [`writer_agreement`] verdict plus when it last actually changed — `changed_at` is only overwritten when `state` changes, the same "only bump on a genuine transition" discipline `Condition`'s own `lastTransitionTime` already follows in this codebase. Entirely controller-owned; agents never write this.
+                  properties:
+                    changedAt:
+                      description: Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.
+                      format: date-time
+                      type: string
+                    state:
+                      description: One of [`writer_agreement`]'s constants.
+                      type: string
+                  required:
+                  - changedAt
+                  - state
+                  type: object
+                default: {}
+                description: '`strict` only: per-candidate [`writer_agreement`] verdict, computed by the controller from that candidate''s own `nodes[node]` entry. Empty for `bestEffort` — see [`writer_agreement`] (the field below) for its volume-wide equivalent there.'
+                type: object
               nodes:
                 additionalProperties:
                   properties:
@@ -269,6 +295,21 @@ spec:
                 - phase
                 - startedAt
                 - target
+                type: object
+              writerAgreement:
+                description: '`bestEffort` only: the volume-wide [`writer_agreement`] verdict — `Converged` when at most one candidate currently reports itself writer, `Pending` when more than one does. `None` for `strict`, which tracks this per-candidate in `node_writer_agreement` instead.'
+                nullable: true
+                properties:
+                  changedAt:
+                    description: Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.
+                    format: date-time
+                    type: string
+                  state:
+                    description: One of [`writer_agreement`]'s constants.
+                    type: string
+                required:
+                - changedAt
+                - state
                 type: object
             type: object
         required:

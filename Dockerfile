@@ -60,7 +60,7 @@ USER mirrorvol:mirrorvol
 
 # ---------------------------------------------------------------------------
 # Stage: controller — the cluster-wide MirroredVolume controller
-# (mirrorvol-controller/src/main.rs). One replica, per DESIGN.md.
+# (mirrorvol-controller/src/main.rs). One replica.
 # ---------------------------------------------------------------------------
 FROM runtime-base AS controller
 COPY --from=builder /out/mirrorvol-controller /usr/local/bin/mirrorvol-controller
@@ -68,18 +68,29 @@ ENTRYPOINT ["/usr/local/bin/mirrorvol-controller"]
 
 # ---------------------------------------------------------------------------
 # Stage: agent — the per-node backend agent (mirrorvol-agent/src/main.rs),
-# run as the DaemonSet sidecar per ARCHITECTURE-PHASE0.md's deployment
-# topology. Requires NODE_NAME (downward API) at runtime — see main.rs.
+# run as the DaemonSet sidecar alongside syncthing/mirrorvol-csi (see
+# deploy/syncthing/daemonset.yaml). Requires NODE_NAME (downward API) at
+# runtime — see main.rs.
+# rsync/stunnel: this binary shells out to both directly for the rsync
+# backend's own pulls (RsyncBackend's SystemRsyncRunner/SystemStunnelClient)
+# — not just the rsyncd/stunnel sidecars below, which are the server side.
 # ---------------------------------------------------------------------------
 FROM runtime-base AS agent
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rsync \
+    stunnel4 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/stunnel4 /usr/bin/stunnel
+USER mirrorvol:mirrorvol
 COPY --from=builder /out/mirrorvol-agent /usr/local/bin/mirrorvol-agent
 ENTRYPOINT ["/usr/local/bin/mirrorvol-agent"]
 
 # ---------------------------------------------------------------------------
 # Stage: csi — the CSI overlay driver (mirrorvol-csi/src/main.rs), deployed
 # as an extra container in the same DaemonSet pod as the agent/syncthing —
-# see deploy/syncthing/daemonset.yaml and ARCHITECTURE-CSI.md. Deliberately
-# NOT based on runtime-base/its non-root `mirrorvol` user: this binary binds
+# see deploy/syncthing/daemonset.yaml. Deliberately NOT based on
+# runtime-base/its non-root `mirrorvol` user: this binary binds
 # a Unix socket under a hostPath directory and dials another one, both
 # created by root-owned processes — the daemonset.yaml container overrides
 # this image's default user back to root anyway (same reasoning as the
@@ -89,8 +100,28 @@ ENTRYPOINT ["/usr/local/bin/mirrorvol-agent"]
 # self-evidently consistent with it.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim AS csi
+# rsync/stunnel: needed for the same reason as the agent stage's copy of
+# this comment — attach_rsync's own pull-verify shells out to both.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    rsync \
+    stunnel4 \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/stunnel4 /usr/bin/stunnel
 COPY --from=builder /out/mirrorvol-csi /usr/local/bin/mirrorvol-csi
 ENTRYPOINT ["/usr/local/bin/mirrorvol-csi"]
+
+# ---------------------------------------------------------------------------
+# Stage: rsyncd — rsync + stunnel binaries only, no mirrorvol binary. Used
+# by both the `rsyncd` and `stunnel` sidecars in
+# deploy/syncthing/daemonset.yaml (one image, two containers, two
+# different commands) — avoids installing these at every Pod restart via
+# `apk add`, which was slow and occasionally timeout-triggering.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim AS rsyncd
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    rsync \
+    stunnel4 \
+    netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/stunnel4 /usr/bin/stunnel

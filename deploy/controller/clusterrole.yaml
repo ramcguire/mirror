@@ -17,8 +17,8 @@ rules:
     resources:
       - mirroredvolumes/status
     verbs:
-  - "get"
-  - "patch"
+      - "get"
+      - "patch"
   - apiGroups:
     - homelab.internal
     resources:
@@ -53,5 +53,5 @@ rules:
     resources:
       - deployments/scale
     verbs:
-  - "get"
-  - "patch"
+      - "get"
+      - "patch"

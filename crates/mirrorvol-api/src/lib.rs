@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -157,6 +157,7 @@ impl std::fmt::Display for Consistency {
 /// match on the same literal instead of hand-typing `"syncthing"`.
 pub mod backend {
     pub const SYNCTHING: &str = "syncthing";
+    pub const RSYNC: &str = "rsync";
 }
 
 /// Naming/annotation/label conventions shared across crates so they can't
@@ -228,6 +229,26 @@ pub mod naming {
         Some((node, generation))
     }
 
+    /// File name (inside [`env::CONSISTENCY_DIR`]) `mirrorvol-agent` writes
+    /// a volume's resolved active-peer address to, `rsync`-only — read
+    /// back by `mirrorvol-csi`'s `attach_rsync`, which has no Kubernetes
+    /// API access of its own.
+    pub fn active_peer_signal_file_name(volume_id: &str) -> String {
+        format!("{volume_id}.active-peer")
+    }
+
+    /// File name (inside [`env::CONSISTENCY_DIR`]) `mirrorvol-agent` writes
+    /// this node's own controller-computed
+    /// [`writer_agreement`](crate::writer_agreement) verdict to (`strict`
+    /// only — `bestEffort` has nothing per-node to relay, see
+    /// `MirroredVolumeStatus::writer_agreement`) — read back by
+    /// `mirrorvol-csi`'s attach hook as a supplementary veto alongside its
+    /// own live local check, since it has no Kubernetes API access of its
+    /// own to read `status.nodeWriterAgreement` directly.
+    pub fn writer_agreement_signal_file_name(volume_id: &str) -> String {
+        format!("{volume_id}.writer-agreement")
+    }
+
     /// Per-node Syncthing API key `Secret` name — get-or-created by that
     /// node's agent, same self-ownership shape as
     /// [`BackendNode`](crate::BackendNode).
@@ -235,7 +256,39 @@ pub mod naming {
         format!("mirrorvol-syncthing-apikey-{node}")
     }
 
-    /// Per-node `Service` name fronting one node's Syncthing sync port.
+    /// The rsync module password `Secret`'s name — **not** per-node,
+    /// unlike [`per_node_secret_name`]: a puller needs the *source*
+    /// node's secret, not its own, so every candidate shares one value.
+    /// Owned by [`CONTROLLER_DEPLOYMENT_NAME`] (install-wide scope), not by
+    /// any one `Node`: deleting an unrelated node must never delete a
+    /// secret every other candidate still depends on.
+    pub const RSYNC_SHARED_SECRET_NAME: &str = "mirrorvol-rsync-secret";
+
+    /// Per-node `rsync` device identity token `Secret` name — **unlike**
+    /// [`RSYNC_SHARED_SECRET_NAME`] (the shared module *auth* password),
+    /// this is per-node and owned by that node's `Node`, mirroring
+    /// [`per_node_secret_name`]'s shape exactly. Deliberately a separate
+    /// `Secret` from both: "are you allowed to connect" (shared password)
+    /// and "which device is this" (this token, backing
+    /// `BackendNodeStatus::identity_generation`'s contradiction detection)
+    /// are different concerns that used to be conflated by reusing the
+    /// node name as `rsync`'s `device_id`.
+    pub fn per_node_rsync_identity_secret_name(node: &str) -> String {
+        format!("mirrorvol-rsync-identity-{node}")
+    }
+
+    /// The `mirrorvol-controller` `Deployment`'s well-known name — the
+    /// owner for objects whose scope is "this operator installation exists"
+    /// (currently just [`RSYNC_SHARED_SECRET_NAME`]), as opposed to
+    /// per-node objects owned by a `Node`. Must match
+    /// `deploy/controller/deployment.yaml`'s `metadata.name`. Hardcoded,
+    /// same convention as [`SYNCTHING_POD_APP_NAME`]/
+    /// [`RSYNC_SHARED_SECRET_NAME`] themselves.
+    pub const CONTROLLER_DEPLOYMENT_NAME: &str = "mirrorvol-controller";
+
+    /// Per-node `Service` name fronting one node's Syncthing sync port,
+    /// plus the `stunnel` sidecar's TLS port when that node runs `rsync`.
+    /// One per-node Service shared by every backend, not one per backend.
     /// Get-or-created by that node's agent at startup, selecting on
     /// [`NODE_LABEL`].
     pub fn per_node_service_name(node: &str) -> String {
@@ -336,16 +389,42 @@ pub struct StorageSpec {
     #[schemars(schema_with = "opaque_json_schema")]
     pub claim_template: serde_json::Value,
 
-    /// `bestEffort` only, off by default: once the active node's replica is
-    /// observed healthy, every other candidate's folder is patched to
-    /// `Receive Only` as hygiene against accidental concurrent writes.
-    #[serde(default)]
-    pub pull_only: bool,
-
     /// Gitignore-style patterns applied identically on every candidate. Files
     /// these patterns match should never be synced in either direction.
     #[serde(default)]
     pub ignore_patterns: Vec<String>,
+
+    /// `backend: rsync` only: how often a standby candidate's periodic warm
+    /// sync pulls from the active node, keeping it warm ahead of any move.
+    /// Independent of the gated final resync a `strict` promotion runs at
+    /// `AwaitingRelease`/before `acquire_writer` (see
+    /// `mirrorvol-backend::rsync`'s `completion`), which always runs a
+    /// fresh full pass regardless of this interval. Ignored by every other
+    /// backend. No volume has been measured yet, so this default (like
+    /// `operationTimeoutSeconds`'s) is a starting guess, not a tuned value.
+    #[serde(default = "default_warm_sync_interval_seconds")]
+    pub warm_sync_interval_seconds: u32,
+
+    /// `bestEffort` only: how long `status.writerAgreement` may stay
+    /// `Pending` (more than one candidate currently write-capable) before
+    /// the controller surfaces a `Degraded`/`MultipleWriters` condition.
+    /// Informational only — never gates, same as `SyncConflict`. `strict`
+    /// reuses `operationTimeoutSeconds` for the analogous bound instead
+    /// (its own `Pending` only ever exists inside a live, deadline-bound
+    /// operation), so this field is ignored there. Bounded by how long a
+    /// candidate's *initial* full sync can legitimately take, which is
+    /// unmeasured and data-size-dependent — same starting-guess caveat as
+    /// `operationTimeoutSeconds`/`warmSyncIntervalSeconds`.
+    #[serde(default = "default_writer_agreement_timeout_seconds")]
+    pub writer_agreement_timeout_seconds: u32,
+}
+
+fn default_warm_sync_interval_seconds() -> u32 {
+    300
+}
+
+fn default_writer_agreement_timeout_seconds() -> u32 {
+    1800
 }
 
 pub mod phase {
@@ -353,7 +432,6 @@ pub mod phase {
     pub const AWAITING_RELEASE: &str = "AwaitingRelease";
     pub const ENFORCING_STANDBY: &str = "EnforcingStandby";
     pub const GRANTING: &str = "Granting";
-    pub const ACTIVATING: &str = "Activating";
     pub const DEGRADED: &str = "Degraded";
 }
 
@@ -364,6 +442,28 @@ pub mod phase {
 pub mod role {
     pub const WRITER: &str = "Writer";
     pub const STANDBY: &str = "Standby";
+}
+
+/// [`WriterAgreementEntry::state`] values — computed entirely by
+/// `mirrorvol-controller` (never the agent) from data agents already
+/// report (`NodeSyncStatus.role`/`lock_epoch` for `strict`; a count of
+/// `role == Writer` across candidates for `bestEffort`). Kept as a plain
+/// `String` on the wire for the same reason [`phase`]/[`role`] are.
+///
+/// - `CONVERGED`: role and lock agree with what's expected right now (or,
+///   for a standby, there's nothing to disagree about).
+/// - `PENDING`: role and lock disagree, but something currently authorizes
+///   this node to be converging toward `Writer` — expected and
+///   self-healing. `strict` bounds this with the operation's own
+///   `deadline`; `bestEffort` bounds it with
+///   `StorageSpec::writer_agreement_timeout_seconds`.
+/// - `CONTRADICTION`: `strict` only — role and lock disagree with nothing
+///   authorizing it. Never expected to resolve on its own, so it's never
+///   time-gated the way `PENDING` is.
+pub mod writer_agreement {
+    pub const CONVERGED: &str = "Converged";
+    pub const PENDING: &str = "Pending";
+    pub const CONTRADICTION: &str = "Contradiction";
 }
 
 // See MirroredVolumeSpec's own comment above — no rustdoc [link] syntax on
@@ -445,6 +545,19 @@ pub struct PromotionGrant {
     pub epoch: u64,
 }
 
+/// One [`writer_agreement`] verdict plus when it last actually changed —
+/// `changed_at` is only overwritten when `state` changes, the same
+/// "only bump on a genuine transition" discipline `Condition`'s own
+/// `lastTransitionTime` already follows in this codebase. Entirely
+/// controller-owned; agents never write this.
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct WriterAgreementEntry {
+    /// One of [`writer_agreement`]'s constants.
+    pub state: String,
+    pub changed_at: Time,
+}
+
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq, JsonSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct MirroredVolumeStatus {
@@ -469,6 +582,20 @@ pub struct MirroredVolumeStatus {
     /// Set on first sighting of a node; never auto-updated after that.
     #[serde(default)]
     pub node_identity_generations: BTreeMap<String, u64>,
+
+    /// `strict` only: per-candidate [`writer_agreement`] verdict, computed
+    /// by the controller from that candidate's own `nodes[node]` entry.
+    /// Empty for `bestEffort` — see [`writer_agreement`] (the field below)
+    /// for its volume-wide equivalent there.
+    #[serde(default)]
+    pub node_writer_agreement: BTreeMap<String, WriterAgreementEntry>,
+
+    /// `bestEffort` only: the volume-wide [`writer_agreement`] verdict —
+    /// `Converged` when at most one candidate currently reports itself
+    /// writer, `Pending` when more than one does. `None` for `strict`,
+    /// which tracks this per-candidate in `node_writer_agreement` instead.
+    #[serde(default)]
+    pub writer_agreement: Option<WriterAgreementEntry>,
 }
 
 /// One per (node, backend type): a node can run more than one backend for
@@ -572,6 +699,20 @@ mod tests {
             )]),
             conditions: vec![],
             node_identity_generations: BTreeMap::from([("node-a".to_owned(), 2)]),
+            node_writer_agreement: BTreeMap::from([(
+                "node-a".to_owned(),
+                WriterAgreementEntry {
+                    state: writer_agreement::CONVERGED.to_owned(),
+                    // Whole seconds only — Time's wire format is
+                    // second-precision RFC3339, so a sub-second value
+                    // wouldn't round-trip through JSON unchanged.
+                    changed_at: Time(
+                        chrono::DateTime::from_timestamp(1_700_000_000, 0)
+                            .expect("valid timestamp"),
+                    ),
+                },
+            )]),
+            writer_agreement: None,
         };
         assert_eq!(
             status,

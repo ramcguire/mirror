@@ -29,3 +29,7 @@ async-trait = { workspace = true }
 [build-dependencies]
 tonic-prost-build = { workspace = true }
 protoc-bin-vendored = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

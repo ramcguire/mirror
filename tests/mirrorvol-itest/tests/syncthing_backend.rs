@@ -20,6 +20,7 @@ fn replica_config(peer_device_id: &str) -> ReplicaConfig {
         peer_addresses: Default::default(),
         generation: 1,
         ignore_patterns: vec![],
+        active_peer_address: None,
     }
 }
 

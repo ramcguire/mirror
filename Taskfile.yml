@@ -3,7 +3,7 @@ version: "3"
 
 vars:
   CLUSTER_NAME: mirrorvol
-  KIND_CONFIG: "{{.ROOT_DIR}}/kind/kind-config.yaml"
+  KIND_CONFIG: "{{.ROOT_DIR}}/tests/kind/kind-config.yaml"
   KIND_KUBECONFIG: "{{.ROOT_DIR}}/.kind/kubeconfig"
   CRD_FILE: "{{.ROOT_DIR}}/deploy/crds/mirroredvolume.yaml"
   IMAGE_BUILDER: mirrorvol-image-builder
@@ -185,7 +185,7 @@ tasks:
       - kubectl apply -k "{{.ROOT_DIR}}/deploy/"
       - kubectl -n mirrorvol rollout restart daemonset/mirrorvol-syncthing
       - kubectl -n mirrorvol rollout restart deployment/mirrorvol-controller
-      - kubectl -n mirrorvol rollout status daemonset/mirrorvol-syncthing --timeout=180s
+      - kubectl -n mirrorvol rollout status daemonset/mirrorvol-syncthing --timeout=300s
       - kubectl -n mirrorvol rollout status deployment/mirrorvol-controller --timeout=60s
 
   csi:install-test-driver:
@@ -194,7 +194,7 @@ tasks:
       underlying driver mirrorvol-csi wraps in test:csi.
     deps: [deploy:full]
     cmds:
-      - kubectl apply -f "{{.ROOT_DIR}}/deploy/csi/host-path-driver.yaml"
+      - kubectl apply -f "{{.ROOT_DIR}}/tests/fixtures/host-path-driver.yaml"
       - kubectl -n mirrorvol rollout status daemonset/csi-hostpath-test-driver --timeout=120s
 
   image:builder:up:
@@ -210,12 +210,22 @@ tasks:
     if: docker buildx inspect {{.IMAGE_BUILDER}} >/dev/null 2>&1
     cmd: docker buildx rm {{.IMAGE_BUILDER}}
 
+  # None of the four image:build:* tasks below use a `status:` check —
+  # deliberately. A presence-only check (`docker image inspect ... &&
+  # skip`) silently reuses a stale image once the tag exists at all, even
+  # when the source changed since — a real footgun for iterative local
+  # development (caught the hard way debugging a real writer-agreement
+  # regression that turned out to be `task kind:load` quietly never
+  # rebuilding `mirrorvol-csi` after a code change).
+  # `docker buildx build` already has its own real, content-aware layer
+  # cache (cargo-chef's dependency layer alone makes an unchanged rebuild
+  # take seconds, not minutes) — that's the right place for this caching
+  # to live, not a presence check one level up that can't tell "unchanged"
+  # from "stale."
   image:build:controller:
     desc: 'Build the controller image for your host platform only, loaded into the local docker daemon (for `task kind:load`). Fast path for local iteration.'
     dir: "{{.ROOT_DIR}}"
     deps: [image:builder:up]
-    status:
-      - docker image inspect {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} >/dev/null 2>&1
     cmds:
       - docker buildx build --target controller --load -t {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} .
 
@@ -223,8 +233,6 @@ tasks:
     desc: 'Build the agent image for your host platform only, loaded into the local docker daemon. See image:build:controller.'
     deps: [image:builder:up]
     dir: "{{.ROOT_DIR}}"
-    status:
-      - docker image inspect {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} >/dev/null 2>&1
     cmds:
       - docker buildx build --target agent --load -t {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} .
 
@@ -232,22 +240,28 @@ tasks:
     desc: 'Build the mirrorvol-csi image for your host platform only, loaded into the local docker daemon. See image:build:controller.'
     deps: [image:builder:up]
     dir: "{{.ROOT_DIR}}"
-    status:
-      - docker image inspect {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} >/dev/null 2>&1
     cmds:
       - docker buildx build --target csi --load -t {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} .
 
+  image:build:rsyncd:
+    desc: 'Build the rsyncd/stunnel sidecar image for your host platform only, loaded into the local docker daemon. See image:build:controller.'
+    deps: [image:builder:up]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - docker buildx build --target rsyncd --load -t {{.IMAGE_REPO}}/rsyncd:{{.IMAGE_TAG}} .
+
   image:build:
-    desc: Build all three images, host-platform-only, loaded locally. What you want during day-to-day development.
+    desc: Build all four images, host-platform-only, loaded locally. What you want during day-to-day development.
     deps: [image:builder:up]
     cmds:
       - defer: { task: 'image:builder:down' }
       - task: image:build:controller
       - task: image:build:agent
       - task: image:build:csi
+      - task: image:build:rsyncd
 
   image:push:
-    desc: 'Multi-arch build+push of all three images (IMAGE_PLATFORMS, default linux/amd64,linux/arm64) to IMAGE_REPO. Requires a real registry.'
+    desc: 'Multi-arch build+push of all four images (IMAGE_PLATFORMS, default linux/amd64,linux/arm64) to IMAGE_REPO. Requires a real registry.'
     deps: [image:builder:up]
     dir: "{{.ROOT_DIR}}"
     requires:
@@ -258,14 +272,16 @@ tasks:
       - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target controller -t {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} --push .
       - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target agent -t {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} --push .
       - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target csi -t {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} --push .
+      - docker buildx build --builder {{.IMAGE_BUILDER}} --platform {{.IMAGE_PLATFORMS}} --target rsyncd -t {{.IMAGE_REPO}}/rsyncd:{{.IMAGE_TAG}} --push .
 
   kind:load:
-    desc: Build all three images locally and load them straight into the KinD cluster's image store.
+    desc: Build all four images locally and load them straight into the KinD cluster's image store.
     deps: [cluster:up, image:build]
     cmds:
       - kind load docker-image {{.IMAGE_REPO}}/controller:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
       - kind load docker-image {{.IMAGE_REPO}}/agent:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
       - kind load docker-image {{.IMAGE_REPO}}/csi:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
+      - kind load docker-image {{.IMAGE_REPO}}/rsyncd:{{.IMAGE_TAG}} --name {{.CLUSTER_NAME}}
 
   test:unit:
     desc: Fast, cluster-free unit tests (what CI should run on every push).
@@ -277,11 +293,13 @@ tasks:
     desc: >-
       Run the fast, real-cluster tests against an already
       running KinD cluster. Doesn't need images or a full deploy.
+      rsync_backend additionally needs local `rsync`/`stunnel` client
+      binaries on PATH (Docker only runs the peer side).
     deps: [crds:sync]
     dir: "{{.ROOT_DIR}}"
     cmds:
       - task: rbac:apply
-      - cargo test -p mirrorvol-itest --test integration --test rbac --test syncthing_backend -- --ignored --test-threads=1 --nocapture
+      - cargo test -p mirrorvol-itest --test integration --test rbac --test syncthing_backend --test rsync_backend --no-fail-fast -- --ignored --test-threads=1 --nocapture
 
   test:e2e:
     desc: >-
@@ -298,14 +316,40 @@ tasks:
     cmds:
       - cargo test -p mirrorvol-itest --test csi_overlay -- --ignored --test-threads=1 --nocapture
 
+  test:identity:
+    desc: >-
+      Proves the identity/secrets ownership fix against a real API server —
+      needs deploy:full (not just crds:sync/rbac:apply like test:integration)
+      since it reads Secrets the agent DaemonSet's provision initContainer
+      actually created.
+    deps: [deploy:full]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo test -p mirrorvol-itest --test identity_and_secrets -- --ignored --test-threads=1 --nocapture
+
+  test:writer-agreement:
+    desc: >-
+      Proves the writer-agreement CSI veto against a real cluster by briefly
+      pausing mirrorvol-controller (scaled to 0) so an injected
+      status.nodeWriterAgreement contradiction isn't self-healed before the
+      real agent relays it and a fresh attach is forced. Pauses the
+      cluster-wide controller Deployment — must run in isolation, never
+      alongside another task that needs it live.
+    deps: [csi:install-test-driver]
+    dir: "{{.ROOT_DIR}}"
+    cmds:
+      - cargo test -p mirrorvol-itest --test writer_agreement -- --ignored --test-threads=1 --nocapture
+
   test:integration:full:
-    desc: 'Full ephemeral cycle: create a fresh cluster, run integration + e2e + CSI tests, tear down.'
+    desc: 'Full ephemeral cycle: create a fresh cluster, run integration + identity + e2e + CSI + writer-agreement tests, tear down.'
     cmds:
       - task: cluster:recreate
       - task: crds:sync
       - task: test:integration
+      - task: test:identity
       - task: test:e2e
       - task: test:csi
+      - task: test:writer-agreement
       - task: cluster:down
 
   test:all:

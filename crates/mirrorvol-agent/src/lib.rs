@@ -2,8 +2,11 @@
 //! [`reconcile_local`], the only thing allowed to call a [`LocalBackend`],
 //! and only ever against its own node.
 
+use std::time::Duration;
+
 use mirrorvol_api::{
-    phase, role, Consistency, MirroredVolumeStatus, NodeSyncStatus, PromotionOperation,
+    phase, role, Consistency, MirroredVolume, MirroredVolumeStatus, NodeSyncStatus,
+    PromotionOperation,
 };
 use mirrorvol_backend::{
     CompletionStatus, LocalBackend, LockState, ReplicaConfig, WriterOperation,
@@ -14,6 +17,202 @@ fn writer_operation(operation: &PromotionOperation, node: &str) -> WriterOperati
         operation_id: operation.id,
         epoch: operation.epoch,
         writer_node: node.to_owned(),
+    }
+}
+
+/// Everything [`reconcile_node`] reads from the cluster on `main.rs`'s
+/// behalf, kept out of [`reconcile_local`] so that stays a pure function
+/// over trait objects with no `kube::Client` in its signature. One method
+/// per distinct read, same shape as `mirrorvol-controller`'s
+/// `ClusterReader` — the sequencing between these three, not any one read
+/// alone, is what [`reconcile_node`] exists to cover.
+#[async_trait::async_trait]
+pub trait NodeReader: Send + Sync {
+    /// This node's own `ReplicaConfig` for `mv`: peer device set/addresses
+    /// from every candidate's `BackendNode`, this node's real replica path,
+    /// and (`rsync`-only) the current active peer to pull from.
+    async fn replica_config(&self, mv: &MirroredVolume) -> Result<ReplicaConfig, String>;
+
+    /// UIDs of every Pod on this node currently running `mv`'s workload.
+    async fn local_writer_pod_uids(&self, mv: &MirroredVolume) -> Result<Vec<String>, String>;
+
+    /// Whether this node is `status.operation`'s source, has fully drained
+    /// (its previously observed writer Pods are gone from `current_pods`),
+    /// and every one of those Pods' host cgroup/kubelet record also proves
+    /// gone. Infallible by design — fails closed (`false`, lock stays
+    /// present) rather than surfacing a request error the way the other two
+    /// reads do, since a `false` here already means "keep the source
+    /// locked," the same conservative outcome an error should produce.
+    async fn source_quiesced(&self, status: &MirroredVolumeStatus, current_pods: &[String])
+        -> bool;
+}
+
+/// Selects the writer-agreement value [`reconcile_node`] relays to
+/// `mirrorvol-csi` for `node` — pure, so it's testable without a real
+/// reconcile. A missing entry (this node has no
+/// [`node_writer_agreement`](MirroredVolumeStatus::node_writer_agreement)
+/// entry yet — `bestEffort`, or `strict` before this agent's first
+/// reconcile of this volume) defaults to `Converged` (no veto): a relay
+/// this agent hasn't populated yet must never itself block an otherwise-
+/// healthy attach, since the live local check in `mirrorvol-csi` remains
+/// the authoritative gate either way.
+pub fn writer_agreement_signal_value<'a>(status: &'a MirroredVolumeStatus, node: &str) -> &'a str {
+    status
+        .node_writer_agreement
+        .get(node)
+        .map_or(mirrorvol_api::writer_agreement::CONVERGED, |entry| {
+            entry.state.as_str()
+        })
+}
+
+/// Everything `main.rs` needs to turn one [`reconcile_node`] call into
+/// signal-file writes and a status patch: the three cross-process signal
+/// values (`None` only when this node isn't a candidate at all — see
+/// `requeue_after`), the node's own sync status to patch (`None` on a
+/// `NodeReader` failure or a [`reconcile_local`] failure — nothing was
+/// decided yet), and how long to wait before the next reconcile.
+pub struct NodeReconcileOutcome {
+    /// This volume's resolved `spec.consistency`, always known once this
+    /// node is a candidate — needs no read.
+    pub consistency_signal: Option<String>,
+    /// `rsync`-only in practice; empty string for every other backend, same
+    /// fallback [`mirrorvol_api::ReplicaConfig::active_peer_address`]'s own
+    /// caller already used. Only known once [`NodeReader::replica_config`]
+    /// succeeds.
+    pub active_peer_signal: Option<String>,
+    /// Always known once this node is a candidate — needs no read.
+    pub writer_agreement_signal: Option<String>,
+    pub node_status: Option<NodeSyncStatus>,
+    /// `None` means "wait for the next relevant change"
+    /// (`Action::await_change()` in `main.rs`) — this node isn't a
+    /// candidate for this volume at all. `Some` is the ordinary
+    /// requeue-after duration.
+    pub requeue_after: Option<Duration>,
+    /// The `NodeReader`/[`reconcile_local`] error that caused this
+    /// reconcile to stop early, if any — carried through so `main.rs` can
+    /// still log it with context, since `reconcile_node` itself stays free
+    /// of logging (same convention `mirrorvol-controller`'s `reconcile`
+    /// follows).
+    pub error: Option<String>,
+}
+
+/// The whole per-reconcile sequence `main.rs::reconcile()` used to hold
+/// directly: the candidate guard, the three `NodeReader`-gated reads, then
+/// [`reconcile_local`] — one function a test can now drive end to end.
+/// `backend` is resolved by the caller (a synchronous registry lookup, not
+/// a read this trait needs to cover) — `None` reports this node has no
+/// backend configured for `mv.spec.backend` at all, the same defensive case
+/// `main.rs` always treated as a 15s-retry rather than an error, since
+/// admission already requires every candidate to have a matching
+/// `BackendNode` before a volume is acted on.
+pub async fn reconcile_node<R: NodeReader>(
+    node: &str,
+    mv: &MirroredVolume,
+    status: &MirroredVolumeStatus,
+    reader: &R,
+    backend: Option<&dyn LocalBackend>,
+) -> NodeReconcileOutcome {
+    if !mv
+        .spec
+        .candidate_nodes
+        .iter()
+        .any(|candidate| candidate == node)
+    {
+        return NodeReconcileOutcome {
+            consistency_signal: None,
+            active_peer_signal: None,
+            writer_agreement_signal: None,
+            node_status: None,
+            requeue_after: None,
+            error: None,
+        };
+    }
+
+    // Neither needs a read: consistency comes straight from `mv.spec`,
+    // writer-agreement straight from `status` — both already in hand.
+    // Emitted whenever this node is a candidate, independent of whether the
+    // reads below succeed (a deliberate simplification over the ordering
+    // `main.rs` used to have incidentally, where the writer-agreement
+    // signal win was gated on `replica_config` succeeding despite not
+    // needing its result).
+    let consistency_signal = Some(mv.spec.consistency.as_str().to_owned());
+    let writer_agreement_signal = Some(writer_agreement_signal_value(status, node).to_owned());
+
+    let config = match reader.replica_config(mv).await {
+        Ok(config) => config,
+        Err(error) => {
+            return NodeReconcileOutcome {
+                consistency_signal,
+                active_peer_signal: None,
+                writer_agreement_signal,
+                node_status: None,
+                requeue_after: Some(Duration::from_secs(15)),
+                error: Some(error),
+            };
+        }
+    };
+    let active_peer_signal = Some(config.active_peer_address.clone().unwrap_or_default());
+
+    let writer_pod_uids = match reader.local_writer_pod_uids(mv).await {
+        Ok(pods) => pods,
+        Err(error) => {
+            return NodeReconcileOutcome {
+                consistency_signal,
+                active_peer_signal,
+                writer_agreement_signal,
+                node_status: None,
+                requeue_after: Some(Duration::from_secs(15)),
+                error: Some(error),
+            };
+        }
+    };
+
+    let Some(backend) = backend else {
+        return NodeReconcileOutcome {
+            consistency_signal,
+            active_peer_signal,
+            writer_agreement_signal,
+            node_status: None,
+            requeue_after: Some(Duration::from_secs(15)),
+            error: Some(format!(
+                "this node's agent has no backend configured for {}",
+                mv.spec.backend
+            )),
+        };
+    };
+
+    let quiesced = reader.source_quiesced(status, &writer_pod_uids).await;
+    let node_status = match reconcile_local(
+        node,
+        &config,
+        status,
+        mv.spec.consistency,
+        quiesced,
+        writer_pod_uids,
+        backend,
+    )
+    .await
+    {
+        Ok(node_status) => node_status,
+        Err(error) => {
+            return NodeReconcileOutcome {
+                consistency_signal,
+                active_peer_signal,
+                writer_agreement_signal,
+                node_status: None,
+                requeue_after: Some(Duration::from_secs(5)),
+                error: Some(error),
+            };
+        }
+    };
+
+    NodeReconcileOutcome {
+        consistency_signal,
+        active_peer_signal,
+        writer_agreement_signal,
+        node_status: Some(node_status),
+        requeue_after: Some(Duration::from_secs(5)),
+        error: None,
     }
 }
 
@@ -34,20 +233,12 @@ pub fn next_identity_generation(existing: Option<(&str, u64)>, new_device_id: &s
 /// after the caller has proved both workload termination and local mount
 /// teardown — ignored in `bestEffort`, which never drains or quiesces
 /// anything. Passing `false` is fail-closed: the source lock remains
-/// present. `pull_only` is `bestEffort`-only (see
-/// [`StorageSpec::pull_only`](mirrorvol_api::StorageSpec::pull_only)) —
-/// read only when `consistency` is [`Consistency::BestEffort`], ignored
-/// for [`Consistency::Strict`], which is why it's its own parameter rather
-/// than bundled into `consistency` itself: the two are independent fields
-/// on the wire (`spec.consistency`, `spec.storage.pullOnly`), and keeping
-/// them independent here means nothing has to re-pack them into a bespoke
-/// sum type just to call this.
-pub async fn reconcile_local<B: LocalBackend>(
+/// present.
+pub async fn reconcile_local<B: LocalBackend + ?Sized>(
     node: &str,
     replica: &ReplicaConfig,
     status: &MirroredVolumeStatus,
     consistency: Consistency,
-    pull_only: bool,
     source_quiesced: bool,
     writer_pod_uids: Vec<String>,
     backend: &B,
@@ -73,13 +264,12 @@ pub async fn reconcile_local<B: LocalBackend>(
             .await
         }
         Consistency::BestEffort => {
-            reconcile_local_best_effort(node, replica, status, pull_only, writer_pod_uids, backend)
-                .await
+            reconcile_local_best_effort(node, replica, status, writer_pod_uids, backend).await
         }
     }
 }
 
-async fn reconcile_local_strict<B: LocalBackend>(
+async fn reconcile_local_strict<B: LocalBackend + ?Sized>(
     node: &str,
     replica: &ReplicaConfig,
     status: &MirroredVolumeStatus,
@@ -131,7 +321,7 @@ async fn reconcile_local_strict<B: LocalBackend>(
 
     // Fetched at most once per reconcile, so a value read inside the
     // `operation` branch stays valid for the final status.
-    let mut completion: Option<B::Completion> = None;
+    let mut completion: Option<Box<dyn CompletionStatus>> = None;
 
     let operation = status.operation.as_ref();
     let current_operation_id = operation.map(|operation| operation.id);
@@ -202,24 +392,53 @@ async fn reconcile_local_strict<B: LocalBackend>(
             grant.operation_id == operation.id
                 && grant.target == node
                 && grant.epoch == operation.epoch
-        }) && !backend
-            .is_writer(&replica.volume_id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            // Live and local, not the target's previous CRD report. Only
-            // reachable before this node has actually acquired the writer
-            // role. Once it has, its lock reads back Present on every
-            // later reconcile, so this must not re-run then.
-            if !completion.ready() || !matches!(lock_state, LockState::Absent) {
-                return Err(
-                    "writer grant rejected: local replica is not ready or lock is present".into(),
-                );
-            }
-            backend
-                .acquire_writer(&replica.volume_id, &writer_operation)
+        }) {
+            // Live and local, not the target's previous CRD report.
+            let is_writer = backend
+                .is_writer(&replica.volume_id)
                 .await
                 .map_err(|error| error.to_string())?;
+            let lock_matches_epoch =
+                matches!(lock_state, LockState::Present { epoch: Some(e) } if e == operation.epoch);
+            // Not yet converged: role and lock disagree with what this
+            // grant authorizes. Covers both the ordinary first-acquisition
+            // case and the crash-recovery case (role already flipped by a
+            // previous attempt, but the process died before the lock was
+            // created) — `acquire_writer`'s own internal lock_state check
+            // makes it safe to call in either case. Once converged, this
+            // whole branch is a no-op on every later reconcile.
+            if !(is_writer && lock_matches_epoch) {
+                match lock_state {
+                    LockState::Absent => {
+                        if !completion.ready() {
+                            return Err("writer grant rejected: local replica is not ready".into());
+                        }
+                        backend
+                            .acquire_writer(&replica.volume_id, &writer_operation)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    LockState::Present {
+                        epoch: Some(lock_epoch),
+                    } if lock_epoch == operation.epoch => {
+                        // The lock already matches this epoch but role
+                        // hasn't caught up — restore rather than
+                        // re-acquire, since a lock for this epoch already
+                        // exists and acquire_writer would reject it.
+                        backend
+                            .restore_writer(&replica.volume_id, operation.epoch)
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                    LockState::Present { .. } => {
+                        // A lock for a *different* epoch is present — a
+                        // genuine conflict, not a retry case.
+                        return Err(
+                            "writer grant rejected: a lock for a different epoch is present".into(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -271,13 +490,16 @@ async fn reconcile_local_strict<B: LocalBackend>(
 }
 
 /// `bestEffort`'s reconcile: no lock/epoch/drain handshake — every
-/// folder defaults to `Send & Receive` unless `pull_only` says otherwise,
-/// and conflicts are surfaced, never gated on.
-async fn reconcile_local_best_effort<B: LocalBackend>(
+/// folder is `Send & Receive`; every other candidate downgrades to
+/// `Receive Only` once the active replica is known-healthy — unconditional
+/// hygiene, not opt-in, so `status.writerAgreement` actually converges to
+/// `Converged` on its own rather than staying `Pending` indefinitely (this
+/// is what replaced the old `pullOnly` flag). Conflicts are surfaced,
+/// never gated on.
+async fn reconcile_local_best_effort<B: LocalBackend + ?Sized>(
     node: &str,
     replica: &ReplicaConfig,
     status: &MirroredVolumeStatus,
-    pull_only: bool,
     writer_pod_uids: Vec<String>,
     backend: &B,
 ) -> Result<NodeSyncStatus, String> {
@@ -285,13 +507,11 @@ async fn reconcile_local_best_effort<B: LocalBackend>(
         .active
         .as_ref()
         .is_some_and(|active| active.node == node);
-    if !pull_only || is_active {
-        // With pull_only off (the default), every node — not just the
-        // active one — keeps re-asserting Send & Receive on every
-        // reconcile. That's what restores it within one tick after the
-        // force-standby initContainer's blanket rewrite on every Pod
-        // restart, without needing that initContainer to know about
-        // per-volume consistency at all.
+    if is_active {
+        // Re-asserted on every reconcile — what restores it within one
+        // tick after the force-standby initContainer's blanket rewrite on
+        // every Pod restart, without that initContainer needing to know
+        // about per-volume consistency at all.
         backend
             .enable_send_receive(&replica.volume_id)
             .await
@@ -302,9 +522,9 @@ async fn reconcile_local_best_effort<B: LocalBackend>(
         .and_then(|active| status.nodes.get(&active.node))
         .is_some_and(|active_node| active_node.ready)
     {
-        // pull_only hygiene: downgrade a non-active node only once the
-        // active replica is already known-healthy — never a gate, just
-        // tidiness, and left alone (whatever it already is) until then.
+        // Downgrade a non-active node only once the active replica is
+        // already known-healthy — never a gate, just tidiness, and left
+        // alone (whatever it already is) until then.
         backend
             .enforce_standby(&replica.volume_id)
             .await
@@ -347,8 +567,11 @@ async fn reconcile_local_best_effort<B: LocalBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mirrorvol_api::{phase, ActiveWriter, NodeSyncStatus, PromotionGrant};
-    use mirrorvol_backend::{BackendError, Call, FakeBackend, FakeCompletion};
+    use mirrorvol_api::{
+        phase, ActiveWriter, MirroredVolumeSpec, NodeSyncStatus, PromotionGrant, StorageSpec,
+        WorkloadRef,
+    };
+    use mirrorvol_backend::{BackendError, Call, FakeBackend};
     use std::collections::BTreeMap;
 
     /// Wraps `FakeBackend` but always fails `lock_state` — for proving that a
@@ -361,15 +584,16 @@ mod tests {
 
     #[async_trait::async_trait]
     impl LocalBackend for FailingLockBackend {
-        type Completion = FakeCompletion;
-
         async fn ensure_replica(&self, config: &ReplicaConfig) -> Result<(), BackendError> {
             self.inner.ensure_replica(config).await
         }
         async fn is_writer(&self, volume_id: &str) -> Result<bool, BackendError> {
             self.inner.is_writer(volume_id).await
         }
-        async fn completion(&self, volume_id: &str) -> Result<Self::Completion, BackendError> {
+        async fn completion(
+            &self,
+            volume_id: &str,
+        ) -> Result<Box<dyn CompletionStatus>, BackendError> {
             self.inner.completion(volume_id).await
         }
         async fn lock_state(&self, _volume_id: &str) -> Result<LockState, BackendError> {
@@ -418,7 +642,260 @@ mod tests {
             peer_addresses: Default::default(),
             generation: 1,
             ignore_patterns: vec![],
+            active_peer_address: None,
         }
+    }
+
+    fn mv(candidate_nodes: &[&str]) -> MirroredVolume {
+        MirroredVolume::new(
+            "volume",
+            MirroredVolumeSpec {
+                workload: WorkloadRef {
+                    kind: "Deployment".to_owned(),
+                    name: "app".to_owned(),
+                    volume_name: "data".to_owned(),
+                    mount_path: "/data".to_owned(),
+                },
+                storage: StorageSpec {
+                    storage_class_name: "local-path".to_owned(),
+                    replica_path_template: "/data/{claim}".to_owned(),
+                    claim_template: serde_json::json!({}),
+                    ignore_patterns: vec![],
+                    warm_sync_interval_seconds: 300,
+                    writer_agreement_timeout_seconds: 1800,
+                },
+                candidate_nodes: candidate_nodes
+                    .iter()
+                    .map(|node| (*node).to_owned())
+                    .collect(),
+                desired_active_node: candidate_nodes.first().unwrap_or(&"node-a").to_string(),
+                operation_timeout_seconds: 900,
+                backend: mirrorvol_api::backend::SYNCTHING.to_owned(),
+                consistency: Consistency::Strict,
+            },
+        )
+    }
+
+    /// Configurable `NodeReader` stub — each method returns whatever was
+    /// last set via its `fail_*`/`set_*` method, defaulting to values that
+    /// let a candidate node proceed all the way to [`reconcile_local`]. A
+    /// `calls` log is also kept, for the rare test that cares about
+    /// short-circuiting itself rather than only the final
+    /// [`NodeReconcileOutcome`].
+    struct FakeNodeReader {
+        replica_config: std::sync::Mutex<Result<ReplicaConfig, String>>,
+        local_writer_pod_uids: std::sync::Mutex<Result<Vec<String>, String>>,
+        source_quiesced: std::sync::Mutex<bool>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Default for FakeNodeReader {
+        fn default() -> Self {
+            Self {
+                replica_config: std::sync::Mutex::new(Ok(replica())),
+                local_writer_pod_uids: std::sync::Mutex::new(Ok(Vec::new())),
+                source_quiesced: std::sync::Mutex::new(false),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl FakeNodeReader {
+        fn fail_replica_config(&self) {
+            *self.replica_config.lock().unwrap() =
+                Err("replica configuration unavailable".to_owned());
+        }
+        fn fail_local_writer_pod_uids(&self) {
+            *self.local_writer_pod_uids.lock().unwrap() =
+                Err("writer pod observation unavailable".to_owned());
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl NodeReader for FakeNodeReader {
+        async fn replica_config(&self, _mv: &MirroredVolume) -> Result<ReplicaConfig, String> {
+            self.calls.lock().unwrap().push("replica_config");
+            self.replica_config.lock().unwrap().clone()
+        }
+
+        async fn local_writer_pod_uids(&self, _mv: &MirroredVolume) -> Result<Vec<String>, String> {
+            self.calls.lock().unwrap().push("local_writer_pod_uids");
+            self.local_writer_pod_uids.lock().unwrap().clone()
+        }
+
+        async fn source_quiesced(
+            &self,
+            _status: &MirroredVolumeStatus,
+            _current_pods: &[String],
+        ) -> bool {
+            self.calls.lock().unwrap().push("source_quiesced");
+            *self.source_quiesced.lock().unwrap()
+        }
+    }
+
+    fn agreement_entry(state: &str) -> mirrorvol_api::WriterAgreementEntry {
+        mirrorvol_api::WriterAgreementEntry {
+            state: state.to_owned(),
+            changed_at: k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(chrono::Utc::now()),
+        }
+    }
+
+    #[test]
+    fn writer_agreement_signal_value_passes_through_a_present_entry() {
+        for state in [
+            mirrorvol_api::writer_agreement::CONVERGED,
+            mirrorvol_api::writer_agreement::PENDING,
+            mirrorvol_api::writer_agreement::CONTRADICTION,
+        ] {
+            let status = MirroredVolumeStatus {
+                node_writer_agreement: BTreeMap::from([(
+                    "node-a".to_owned(),
+                    agreement_entry(state),
+                )]),
+                ..Default::default()
+            };
+            assert_eq!(writer_agreement_signal_value(&status, "node-a"), state);
+        }
+    }
+
+    #[test]
+    fn writer_agreement_signal_value_defaults_to_converged_when_the_node_has_no_entry() {
+        let status = MirroredVolumeStatus {
+            node_writer_agreement: BTreeMap::from([(
+                "node-b".to_owned(),
+                agreement_entry(mirrorvol_api::writer_agreement::CONTRADICTION),
+            )]),
+            ..Default::default()
+        };
+        // node-a has no entry (bestEffort never populates this map at all,
+        // or strict before this agent's first reconcile) — must default to
+        // Converged (no veto), not inherit another node's entry or a more
+        // alarming default.
+        assert_eq!(
+            writer_agreement_signal_value(&status, "node-a"),
+            mirrorvol_api::writer_agreement::CONVERGED
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_node_waits_for_change_when_this_node_is_not_a_candidate() {
+        let reader = FakeNodeReader::default();
+        let backend = FakeBackend::default();
+        let outcome = reconcile_node(
+            "node-c",
+            &mv(&["node-a", "node-b"]),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            Some(&backend),
+        )
+        .await;
+        assert!(outcome.consistency_signal.is_none());
+        assert!(outcome.active_peer_signal.is_none());
+        assert!(outcome.writer_agreement_signal.is_none());
+        assert!(outcome.node_status.is_none());
+        assert!(outcome.requeue_after.is_none());
+        assert!(reader.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_node_still_emits_consistency_and_writer_agreement_signals_when_replica_config_fails(
+    ) {
+        let reader = FakeNodeReader::default();
+        reader.fail_replica_config();
+        let backend = FakeBackend::default();
+        let outcome = reconcile_node(
+            "node-a",
+            &mv(&["node-a", "node-b"]),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            Some(&backend),
+        )
+        .await;
+        // Neither value needs `replica_config`'s result — see reconcile_node's
+        // own doc comment on why they're no longer incidentally gated on it.
+        assert!(outcome.consistency_signal.is_some());
+        assert!(outcome.writer_agreement_signal.is_some());
+        assert!(outcome.active_peer_signal.is_none());
+        assert!(outcome.node_status.is_none());
+        assert_eq!(outcome.requeue_after, Some(Duration::from_secs(15)));
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("replica configuration unavailable")
+        );
+        assert_eq!(reader.calls(), vec!["replica_config"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_node_keeps_the_active_peer_signal_when_local_writer_pod_uids_fails() {
+        let reader = FakeNodeReader::default();
+        reader.fail_local_writer_pod_uids();
+        let backend = FakeBackend::default();
+        let outcome = reconcile_node(
+            "node-a",
+            &mv(&["node-a", "node-b"]),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            Some(&backend),
+        )
+        .await;
+        // Already known from the successful replica_config read above this
+        // one in the sequence.
+        assert!(outcome.active_peer_signal.is_some());
+        assert!(outcome.node_status.is_none());
+        assert_eq!(outcome.requeue_after, Some(Duration::from_secs(15)));
+        assert_eq!(
+            reader.calls(),
+            vec!["replica_config", "local_writer_pod_uids"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_node_reports_a_missing_backend_after_both_reads_succeed() {
+        let reader = FakeNodeReader::default();
+        let outcome = reconcile_node(
+            "node-a",
+            &mv(&["node-a", "node-b"]),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            None,
+        )
+        .await;
+        assert!(outcome.node_status.is_none());
+        assert_eq!(outcome.requeue_after, Some(Duration::from_secs(15)));
+        assert!(outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("no backend configured")));
+        // Both reads still ran — the backend check comes after them,
+        // matching the original ordering.
+        assert_eq!(
+            reader.calls(),
+            vec!["replica_config", "local_writer_pod_uids"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_node_reaches_reconcile_local_and_requeues_at_5s() {
+        let reader = FakeNodeReader::default();
+        let backend = FakeBackend::default();
+        let outcome = reconcile_node(
+            "node-a",
+            &mv(&["node-a", "node-b"]),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            Some(&backend),
+        )
+        .await;
+        assert!(outcome.node_status.is_some());
+        assert_eq!(outcome.requeue_after, Some(Duration::from_secs(5)));
+        assert!(outcome.error.is_none());
+        assert_eq!(
+            reader.calls(),
+            vec!["replica_config", "local_writer_pod_uids", "source_quiesced"]
+        );
     }
 
     fn operation(phase_name: &str) -> PromotionOperation {
@@ -456,13 +933,92 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend
         )
         .await
         .is_err());
+        assert!(!backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::AcquireWriter { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_grant_retries_lock_creation_after_a_crash_between_role_flip_and_lock() {
+        // The crash window this design closes: a previous attempt already
+        // flipped the backend role to writer (is_writer() == true) but the
+        // process died before creating the lock file (lock_state() ==
+        // Absent). The old gate (`!is_writer()`) would treat this as
+        // already done and never retry; the fix must still call
+        // acquire_writer, since acquire_writer's own internal check makes
+        // that safe regardless of the role's current state.
+        let backend = FakeBackend::default();
+        backend.set_completion("volume", true);
+        backend.set_lock_state("volume", LockState::Absent);
+        backend.set_writer("volume", true);
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(operation(phase::GRANTING)),
+            grant: Some(PromotionGrant {
+                operation_id: 2,
+                target: "node-b".to_owned(),
+                epoch: 2,
+            }),
+            ..Default::default()
+        };
+        reconcile_local(
+            "node-b",
+            &replica(),
+            &status,
+            Consistency::Strict,
+            false,
+            vec![],
+            &backend,
+        )
+        .await
+        .expect("reconcile retries lock creation");
+        assert!(backend
+            .calls()
+            .iter()
+            .any(|call| matches!(call, Call::AcquireWriter { .. })));
+    }
+
+    #[tokio::test]
+    async fn a_grant_rejects_a_lock_present_for_a_foreign_epoch() {
+        let backend = FakeBackend::default();
+        backend.set_completion("volume", true);
+        // A lock exists, but for a different epoch than this grant — a
+        // genuine conflict, not a retry case.
+        backend.set_lock_state("volume", LockState::Present { epoch: Some(99) });
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(operation(phase::GRANTING)),
+            grant: Some(PromotionGrant {
+                operation_id: 2,
+                target: "node-b".to_owned(),
+                epoch: 2,
+            }),
+            ..Default::default()
+        };
+        let result = reconcile_local(
+            "node-b",
+            &replica(),
+            &status,
+            Consistency::Strict,
+            false,
+            vec![],
+            &backend,
+        )
+        .await;
+        assert!(result.is_err());
         assert!(!backend
             .calls()
             .iter()
@@ -495,7 +1051,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -518,7 +1073,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -547,7 +1101,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -560,7 +1113,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             true,
             vec![],
             &backend,
@@ -586,7 +1138,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -621,7 +1172,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -654,7 +1204,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::Strict,
-            false, // pull_only: unused for Strict
             false,
             vec![],
             &backend,
@@ -686,7 +1235,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_effort_enables_send_receive_on_every_node_when_pull_only_is_off() {
+    async fn best_effort_active_node_always_enables_send_receive() {
         let backend = FakeBackend::default();
         let status = MirroredVolumeStatus {
             active: Some(ActiveWriter {
@@ -695,14 +1244,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        // node-b is not the active node, yet pull_only is off — every
-        // candidate stays Send & Receive regardless of which one is active.
         reconcile_local(
-            "node-b",
+            "node-a",
             &replica(),
             &status,
             Consistency::BestEffort,
-            false,
             false,
             vec![],
             &backend,
@@ -716,7 +1262,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_effort_pull_only_downgrades_a_non_active_node_once_active_is_ready() {
+    async fn best_effort_downgrades_a_non_active_node_once_active_is_ready() {
+        // Unconditional now — no pullOnly opt-in needed for this to happen.
         let backend = FakeBackend::default();
         let mut nodes = BTreeMap::new();
         nodes.insert(
@@ -739,7 +1286,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::BestEffort,
-            true,
             false,
             vec![],
             &backend,
@@ -757,7 +1303,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn best_effort_pull_only_leaves_a_non_active_node_alone_until_active_is_ready() {
+    async fn best_effort_leaves_a_non_active_node_alone_until_active_is_ready() {
         let backend = FakeBackend::default();
         // No status.nodes entry for node-a at all yet — its readiness is
         // unknown, not confirmed false.
@@ -773,7 +1319,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::BestEffort,
-            true,
             false,
             vec![],
             &backend,
@@ -800,7 +1345,6 @@ mod tests {
             &status,
             Consistency::BestEffort,
             false,
-            false,
             vec![],
             &backend,
         )
@@ -823,7 +1367,6 @@ mod tests {
             &replica(),
             &status,
             Consistency::BestEffort,
-            false,
             false,
             vec![],
             &backend,

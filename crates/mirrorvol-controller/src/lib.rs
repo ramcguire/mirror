@@ -1,12 +1,12 @@
 //! Controller-side policy for immutable promotion operations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use mirrorvol_api::{
-    phase, role, ActiveWriter, Consistency, MirroredVolumeSpec, MirroredVolumeStatus,
-    PromotionGrant, PromotionOperation,
+    phase, role, writer_agreement, ActiveWriter, Consistency, MirroredVolumeSpec,
+    MirroredVolumeStatus, PromotionGrant, PromotionOperation,
 };
 
 #[async_trait::async_trait]
@@ -20,6 +20,241 @@ pub trait AppScaler: Send + Sync {
         volume_name: &str,
         claim_name: &str,
     ) -> Result<(), String>;
+}
+
+/// Everything [`reconcile`] reads from the cluster on `main.rs`'s behalf,
+/// kept out of [`decide`] so that stays a pure function. One method per
+/// distinct read, same shape as [`AppScaler`] — the point isn't hiding
+/// these calls behind one bundled "gather" method, it's letting a test see
+/// (and short-circuit on) each one individually, since the *sequencing*
+/// between them — not any one read itself — is what [`reconcile`] exists to
+/// cover.
+#[async_trait::async_trait]
+pub trait ClusterReader: Send + Sync {
+    /// Every candidate node in `spec` with a `BackendNode` advertising
+    /// `spec.backend`, plus each node's `status.identityGeneration`.
+    async fn backend_status_for_candidates(
+        &self,
+        spec: &MirroredVolumeSpec,
+    ) -> Result<(BTreeSet<String>, BTreeMap<String, u64>), String>;
+
+    /// True if some other `MirroredVolume` in this namespace already names
+    /// the same `(workload.name, workload.volumeName)` pair as `spec`.
+    async fn owned_by_another_volume(
+        &self,
+        self_name: &str,
+        spec: &MirroredVolumeSpec,
+    ) -> Result<bool, String>;
+
+    /// The target Deployment's *configured* (`spec.replicas`) replica
+    /// count — only read before this volume has ever adopted a writer (see
+    /// [`AdmissionContext::pre_adoption_replicas`]).
+    async fn deployment_desired_replicas(&self, deployment: &str) -> Result<u32, String>;
+
+    /// Applies one replica PVC per candidate node from
+    /// `spec.storage.claimTemplate`. A write, but grouped here rather than
+    /// left direct in `main.rs`: its failure gates continuation exactly
+    /// like the reads above do, and that's the boundary this trait actually
+    /// draws — "does this call's outcome affect the sequencing," not
+    /// "is it technically a read."
+    async fn ensure_replica_claims(
+        &self,
+        volume_id: &str,
+        spec: &MirroredVolumeSpec,
+    ) -> Result<(), String>;
+}
+
+/// Everything `main.rs` needs to turn one [`reconcile`] call into
+/// Kubernetes patches: a status to apply (`None` on a `ClusterReader`
+/// failure — nothing was decided yet, so there's nothing to patch), which
+/// annotation keys (if any) to clear, and how long to wait before the next
+/// reconcile. `requeue_after` is computed here rather than in `main.rs` so
+/// the three tiers this picks between (1s operator-override, 15s read
+/// failure, deadline-aware normal path) live next to the logic that
+/// chooses between them instead of being split across two files.
+pub struct ReconcileOutcome {
+    pub status: Option<MirroredVolumeStatus>,
+    pub clear_annotations: Vec<String>,
+    pub requeue_after: Duration,
+    /// The `ClusterReader` error that caused this reconcile to stop early,
+    /// if any — carried through so `main.rs` can still log it with context,
+    /// since `reconcile` itself stays free of logging (same convention
+    /// [`decide`] already follows).
+    pub error: Option<String>,
+}
+
+fn read_failure(error: String) -> ReconcileOutcome {
+    ReconcileOutcome {
+        status: None,
+        clear_annotations: Vec::new(),
+        requeue_after: Duration::from_secs(15),
+        error: Some(error),
+    }
+}
+
+/// Detects a matching
+/// [`RECOVER_DEGRADED_OPERATION_ANNOTATION`](mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION)
+/// override on a `Degraded` volume. Returns the `Recovered` condition's
+/// message when it applies; `None` otherwise. Pure — [`reconcile`] performs
+/// the actual status/annotation changes.
+pub fn degraded_recovery_message(
+    annotations: &BTreeMap<String, String>,
+    status: &MirroredVolumeStatus,
+) -> Option<String> {
+    let operation = status.operation.as_ref()?;
+    if operation.phase != phase::DEGRADED {
+        return None;
+    }
+    let requested =
+        annotations.get(mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION)?;
+    if requested.parse::<u64>() != Ok(operation.id) {
+        return None;
+    }
+    let reason = annotations
+        .get(mirrorvol_api::naming::RECOVERY_REASON_ANNOTATION)
+        .map_or("no reason given", String::as_str);
+    Some(format!(
+        "operator override cleared degraded operation {} (target {}) after externally confirming the prior writer can never run again: {reason}",
+        operation.id, operation.target
+    ))
+}
+
+/// The whole per-reconcile sequence `main.rs::reconcile()` used to hold
+/// directly: both operator-override checks, the four `ClusterReader`-gated
+/// steps, then [`decide`] — one function a test can now drive end to end,
+/// instead of only its pure fragments (`degraded_recovery_message`,
+/// `identity_reenrollment`, `decide` itself) in isolation. `main.rs`
+/// becomes thin wiring: build the real `ClusterReader`/`AppScaler`, call
+/// this, turn the [`ReconcileOutcome`] into patches.
+pub async fn reconcile<R: ClusterReader, S: AppScaler>(
+    name: &str,
+    generation: Option<i64>,
+    annotations: &BTreeMap<String, String>,
+    spec: &MirroredVolumeSpec,
+    status: &MirroredVolumeStatus,
+    reader: &R,
+    scaler: &S,
+) -> ReconcileOutcome {
+    if let Some(message) = degraded_recovery_message(annotations, status) {
+        let mut conditions: Vec<Condition> = status
+            .conditions
+            .iter()
+            .filter(|condition| condition.type_ != "Recovered")
+            .cloned()
+            .collect();
+        conditions.push(Condition {
+            type_: "Recovered".to_owned(),
+            status: "True".to_owned(),
+            reason: "OperatorOverride".to_owned(),
+            message,
+            observed_generation: generation,
+            last_transition_time: Time(chrono::Utc::now()),
+        });
+        return ReconcileOutcome {
+            status: Some(MirroredVolumeStatus {
+                active: None,
+                operation: None,
+                grant: None,
+                conditions,
+                ..status.clone()
+            }),
+            clear_annotations: vec![
+                mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION.to_owned(),
+                mirrorvol_api::naming::RECOVERY_REASON_ANNOTATION.to_owned(),
+            ],
+            requeue_after: Duration::from_secs(1),
+            error: None,
+        };
+    }
+
+    if let Err(error) = reader.ensure_replica_claims(name, spec).await {
+        return read_failure(error);
+    }
+    let (backend_available, identity_generations) =
+        match reader.backend_status_for_candidates(spec).await {
+            Ok(result) => result,
+            Err(error) => return read_failure(error),
+        };
+
+    if let Some((node, new_generation, message)) = identity_reenrollment(
+        annotations,
+        &status.node_identity_generations,
+        &identity_generations,
+    ) {
+        let mut conditions: Vec<Condition> = status
+            .conditions
+            .iter()
+            .filter(|condition| condition.type_ != "IdentityReenrolled")
+            .cloned()
+            .collect();
+        conditions.push(Condition {
+            type_: "IdentityReenrolled".to_owned(),
+            status: "True".to_owned(),
+            reason: "OperatorOverride".to_owned(),
+            message,
+            observed_generation: generation,
+            last_transition_time: Time(chrono::Utc::now()),
+        });
+        let mut node_identity_generations = status.node_identity_generations.clone();
+        node_identity_generations.insert(node, new_generation);
+        return ReconcileOutcome {
+            status: Some(MirroredVolumeStatus {
+                node_identity_generations,
+                conditions,
+                ..status.clone()
+            }),
+            clear_annotations: vec![
+                mirrorvol_api::naming::REENROLL_NODE_IDENTITY_ANNOTATION.to_owned(),
+                mirrorvol_api::naming::RECOVERY_REASON_ANNOTATION.to_owned(),
+            ],
+            requeue_after: Duration::from_secs(1),
+            error: None,
+        };
+    }
+
+    let owned_by_another = match reader.owned_by_another_volume(name, spec).await {
+        Ok(result) => result,
+        Err(error) => return read_failure(error),
+    };
+    // Only read (and only enforce) before this volume has ever adopted a
+    // writer — see AdmissionContext::pre_adoption_replicas.
+    let pre_adoption_replicas = if status.active.is_none() {
+        match reader
+            .deployment_desired_replicas(&spec.workload.name)
+            .await
+        {
+            Ok(replicas) => Some(replicas),
+            Err(error) => return read_failure(error),
+        }
+    } else {
+        None
+    };
+    let admission = AdmissionContext {
+        backend_available: &backend_available,
+        owned_by_another,
+        pre_adoption_replicas,
+    };
+
+    let next = decide(
+        name,
+        spec,
+        status,
+        &admission,
+        &identity_generations,
+        scaler,
+    )
+    .await;
+    let requeue_after = next
+        .operation
+        .as_ref()
+        .map(|operation| Duration::from_secs(seconds_until_deadline(operation).max(1)))
+        .unwrap_or_else(|| Duration::from_secs(5));
+    ReconcileOutcome {
+        status: Some(next),
+        clear_annotations: Vec::new(),
+        requeue_after,
+        error: None,
+    }
 }
 
 /// Re-exported for `main.rs` — see [`mirrorvol_api::naming::replica_claim_name`].
@@ -70,18 +305,25 @@ fn deadline_expired(operation: &PromotionOperation) -> bool {
         .is_ok_and(|deadline| now_seconds() >= deadline)
 }
 
+/// How long until `operation`'s deadline, for `main.rs` to requeue at
+/// exactly that point instead of ticking on a blind fixed interval in the
+/// meantime.
+/// `0` (requeue immediately) both when the deadline has already passed and
+/// when it's unparseable — the same fail-fast reading `deadline_expired`
+/// already gives a malformed deadline.
+pub fn seconds_until_deadline(operation: &PromotionOperation) -> u64 {
+    operation
+        .deadline
+        .parse::<u64>()
+        .unwrap_or(0)
+        .saturating_sub(now_seconds())
+}
+
 fn standby_confirmed(status: &MirroredVolumeStatus, node: &str) -> bool {
     status
         .nodes
         .get(node)
         .is_some_and(|state| state.role == role::STANDBY)
-}
-
-fn writer_confirmed(status: &MirroredVolumeStatus, node: &str, epoch: u64) -> bool {
-    status
-        .nodes
-        .get(node)
-        .is_some_and(|state| state.role == role::WRITER && state.epoch == Some(epoch))
 }
 
 fn all_other_candidates_standby(
@@ -202,6 +444,320 @@ fn sync_conflict_condition(nodes: &[(String, Vec<String>)]) -> Condition {
         status: "True".to_owned(),
         reason: "SyncConflict".to_owned(),
         message: format!("unresolved sync conflicts — {detail}"),
+        observed_generation: None,
+        last_transition_time: Time(chrono::Utc::now()),
+    }
+}
+
+/// Whether a candidate's self-reported backend role and its own local
+/// writer lock agree. Owns the whole concept: the verdict type, computing
+/// it in both consistency modes, and interpreting what it means for a
+/// caller ([`confirmed`]) —
+/// grouped behind one seam instead of touring five-plus separate functions
+/// to hold the invariant in your head. Callers only ever need the three
+/// `pub(super)` entry points below; everything else here is a private
+/// internal seam with its own tests.
+///
+/// Deliberately does **not** own turning a verdict into a `Condition`
+/// (`writer_lock_mismatch_condition`/`writer_agreement_stale_condition`,
+/// both just outside this module) — those follow the same convention every
+/// other condition in this file does (`identity_changed_condition`,
+/// `sync_conflict_condition`, ...): a small function living next to
+/// `decide_strict`/`decide_best_effort`, not folded into whatever computed
+/// the thing it describes.
+mod agreement {
+    use std::collections::BTreeMap;
+
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+    use mirrorvol_api::{
+        role, writer_agreement, MirroredVolumeSpec, MirroredVolumeStatus, NodeSyncStatus,
+        WriterAgreementEntry,
+    };
+
+    use super::phase;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WriterAgreement {
+        /// Role and lock agree with what's expected right now (or, for a
+        /// standby, there's nothing to disagree about).
+        Converged,
+        /// Role and lock disagree, but a live grant currently authorizes
+        /// this node to be converging toward writer — expected,
+        /// self-healing.
+        Pending,
+        /// `strict` only: role and lock disagree with nothing authorizing
+        /// it. Never expected to resolve on its own.
+        Contradiction,
+    }
+
+    impl WriterAgreement {
+        fn as_str(self) -> &'static str {
+            match self {
+                WriterAgreement::Converged => writer_agreement::CONVERGED,
+                WriterAgreement::Pending => writer_agreement::PENDING,
+                WriterAgreement::Contradiction => writer_agreement::CONTRADICTION,
+            }
+        }
+    }
+
+    /// The epoch that would legitimately make `node` a writer right now,
+    /// from data already in `status` — `status.active` if it's the
+    /// committed writer, or the live grant's epoch if it's the target of
+    /// one.
+    fn expected_writer_epoch(status: &MirroredVolumeStatus, node: &str) -> Option<u64> {
+        if let Some(active) = status.active.as_ref().filter(|active| active.node == node) {
+            return Some(active.epoch);
+        }
+        if let (Some(operation), Some(grant)) = (status.operation.as_ref(), status.grant.as_ref()) {
+            if operation.target == node
+                && grant.operation_id == operation.id
+                && grant.target == node
+                && grant.epoch == operation.epoch
+            {
+                return Some(operation.epoch);
+            }
+        }
+        None
+    }
+
+    /// Whether a live operation currently explains `node`'s role/lock
+    /// disagreeing with `expected_writer_epoch` as an expected, self-healing
+    /// transition rather than a genuine contradiction. Both cases are bounded
+    /// to the exact phases `reconcile_local_strict` actually expects the
+    /// disagreement in — not "anywhere in the operation" — so a transition
+    /// that overstays those phases reads as `Contradiction` immediately,
+    /// rather than waiting on the full `operation.deadline` to notice:
+    ///
+    /// - `node` is the operation's *target* with a matching live grant, during
+    ///   `Granting` — the only phase a grant ever exists in (mid-acquire).
+    /// - `node` is the operation's *source*, during `AwaitingRelease` **or**
+    ///   `EnforcingStandby` — the window where its role can legitimately
+    ///   still read `Writer` with its lock already gone. `release_writer`
+    ///   runs once, right as the phase enters `AwaitingRelease`; but
+    ///   `enforce_standby` (the call that actually flips role to `Standby`)
+    ///   only runs once the controller has *already* advanced the phase to
+    ///   `EnforcingStandby` — a real async gap against a live cluster: the
+    ///   agent's own reconcile cadence means at least one real reconcile tick
+    ///   can land with the phase already `EnforcingStandby` but
+    ///   `enforce_standby` not yet having taken effect. Excluding that phase
+    ///   (an earlier, tighter version of this function did) treated that
+    ///   ordinary, expected gap as a genuine contradiction and forced every
+    ///   real promotion straight to `Degraded` within seconds — bounded the
+    ///   same way `AwaitingRelease` already was: `standby_confirmed` gates
+    ///   the phase's own advancement out of `EnforcingStandby`, and
+    ///   `operation.deadline` remains the backstop for a source that's
+    ///   still stuck there once that's overstayed for real.
+    fn in_flight_transition(status: &MirroredVolumeStatus, node: &str) -> bool {
+        status.operation.as_ref().is_some_and(|operation| {
+            (matches!(
+                operation.phase.as_str(),
+                phase::AWAITING_RELEASE | phase::ENFORCING_STANDBY
+            ) && operation.source.as_deref() == Some(node))
+                || (operation.phase == phase::GRANTING
+                    && operation.target == node
+                    && status.grant.as_ref().is_some_and(|grant| {
+                        grant.operation_id == operation.id
+                            && grant.target == node
+                            && grant.epoch == operation.epoch
+                    }))
+        })
+    }
+
+    /// `strict` only. A standby is always `Converged`, whatever its own
+    /// (possibly stale, possibly synced-from-a-past-epoch) copy of the
+    /// lock file shows — the dangerous half of the pair is specifically
+    /// "claims writer without a matching lock." A node with no legitimate
+    /// claim at all (`expected_epoch: None`) reporting itself writer, with
+    /// no in-flight operation to explain it, is always `Contradiction`,
+    /// never `Pending`.
+    fn verdict(
+        node_state: &NodeSyncStatus,
+        expected_epoch: Option<u64>,
+        in_flight_transition: bool,
+    ) -> WriterAgreement {
+        let is_writer = node_state.role == role::WRITER;
+        let lock_matches = expected_epoch.is_some() && node_state.lock_epoch == expected_epoch;
+        match (is_writer, lock_matches, in_flight_transition) {
+            (false, _, _) | (true, true, _) => WriterAgreement::Converged,
+            (true, false, true) => WriterAgreement::Pending,
+            (true, false, false) => WriterAgreement::Contradiction,
+        }
+    }
+
+    /// Replace-if-state-changed, same "don't grow/reset without cause"
+    /// discipline as [`super::upsert_condition`] — `changed_at` is only
+    /// overwritten when `state` actually differs from what's already
+    /// recorded, so `now - changed_at` reflects genuine time-in-state.
+    fn upsert(
+        existing: Option<&WriterAgreementEntry>,
+        state: WriterAgreement,
+    ) -> WriterAgreementEntry {
+        let changed_at = existing
+            .filter(|entry| entry.state == state.as_str())
+            .map(|entry| entry.changed_at.clone())
+            .unwrap_or_else(|| Time(chrono::Utc::now()));
+        WriterAgreementEntry {
+            state: state.as_str().to_owned(),
+            changed_at,
+        }
+    }
+
+    /// `strict`: every candidate's writer-agreement verdict, plus which
+    /// ones are `Contradiction` (the only state that needs a caller
+    /// response — `Pending` is expected and self-healing, `Converged`
+    /// needs nothing).
+    pub(super) fn strict(
+        spec: &MirroredVolumeSpec,
+        status: &MirroredVolumeStatus,
+    ) -> (BTreeMap<String, WriterAgreementEntry>, Vec<String>) {
+        let default_state = NodeSyncStatus::default();
+        let mut updated = BTreeMap::new();
+        let mut contradictions = Vec::new();
+        for node in &spec.candidate_nodes {
+            let node_state = status.nodes.get(node).unwrap_or(&default_state);
+            let expected_epoch = expected_writer_epoch(status, node);
+            let transitioning = in_flight_transition(status, node);
+            let state = verdict(node_state, expected_epoch, transitioning);
+            if state == WriterAgreement::Contradiction {
+                contradictions.push(node.clone());
+            }
+            updated.insert(
+                node.clone(),
+                upsert(status.node_writer_agreement.get(node), state),
+            );
+        }
+        (updated, contradictions)
+    }
+
+    /// `bestEffort`: a volume-wide count, not per-candidate — no single
+    /// agent can see another node's `is_writer()`, so this can only be
+    /// computed here, by aggregating what every candidate's own agent
+    /// already reports into `status.nodes[*].role`. There's no lock to
+    /// disagree with in this mode, so this can never produce
+    /// `Contradiction` — the underlying verdict has no branch that returns
+    /// it. Folds in the same upsert bookkeeping `strict` above already
+    /// does internally, so the caller gets a finished entry in one call
+    /// rather than two.
+    pub(super) fn best_effort(
+        spec: &MirroredVolumeSpec,
+        status: &MirroredVolumeStatus,
+    ) -> WriterAgreementEntry {
+        let writers = spec
+            .candidate_nodes
+            .iter()
+            .filter(|node| {
+                status
+                    .nodes
+                    .get(node.as_str())
+                    .is_some_and(|state| state.role == role::WRITER)
+            })
+            .count();
+        let state = if writers <= 1 {
+            WriterAgreement::Converged
+        } else {
+            WriterAgreement::Pending
+        };
+        upsert(status.writer_agreement.as_ref(), state)
+    }
+
+    /// A target is only confirmed once its own writer-agreement verdict
+    /// reads `Converged` — i.e. its self-reported role *and* its local
+    /// lock both back this epoch, not just the role alone. The epoch
+    /// itself doesn't need a separate parameter here: `node_writer_agreement`
+    /// was computed against the current live grant, so `Converged` already
+    /// means "matches the epoch this grant authorizes." Replaces a
+    /// narrower `role`+self-reported-`epoch`-only check that a backend
+    /// crash between flipping its role and creating its lock could satisfy
+    /// without the lock ever existing.
+    pub(super) fn confirmed(status: &MirroredVolumeStatus, node: &str) -> bool {
+        status
+            .node_writer_agreement
+            .get(node)
+            .is_some_and(|entry| entry.state == writer_agreement::CONVERGED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn node_state(role_value: &str, lock_epoch: Option<u64>) -> NodeSyncStatus {
+            NodeSyncStatus {
+                role: role_value.to_owned(),
+                lock_epoch,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn a_standby_is_always_converged_regardless_of_its_own_lock_copy() {
+            for lock_epoch in [None, Some(1), Some(99)] {
+                assert_eq!(
+                    verdict(&node_state(role::STANDBY, lock_epoch), Some(1), false),
+                    WriterAgreement::Converged
+                );
+            }
+        }
+
+        #[test]
+        fn a_writer_with_a_matching_lock_is_converged() {
+            assert_eq!(
+                verdict(&node_state(role::WRITER, Some(1)), Some(1), false),
+                WriterAgreement::Converged
+            );
+        }
+
+        #[test]
+        fn a_writer_with_no_legitimate_claim_and_no_in_flight_transition_is_a_contradiction() {
+            assert_eq!(
+                verdict(&node_state(role::WRITER, None), None, false),
+                WriterAgreement::Contradiction
+            );
+        }
+
+        #[test]
+        fn a_writer_with_a_mismatched_lock_but_an_explaining_in_flight_transition_is_pending() {
+            assert_eq!(
+                verdict(&node_state(role::WRITER, Some(1)), Some(2), true),
+                WriterAgreement::Pending
+            );
+        }
+
+        #[test]
+        fn a_writer_with_a_mismatched_lock_and_no_explaining_transition_is_a_contradiction() {
+            assert_eq!(
+                verdict(&node_state(role::WRITER, Some(1)), Some(2), false),
+                WriterAgreement::Contradiction
+            );
+        }
+    }
+}
+
+fn writer_lock_mismatch_condition(nodes: &[String]) -> Condition {
+    Condition {
+        type_: "WriterLockMismatch".to_owned(),
+        status: "True".to_owned(),
+        reason: "LocalLockDisagreesWithRole".to_owned(),
+        message: format!(
+            "backend role and local writer lock disagree on: {} — operator investigation required",
+            nodes.join(", ")
+        ),
+        observed_generation: None,
+        last_transition_time: Time(chrono::Utc::now()),
+    }
+}
+
+fn seconds_since(time: &Time) -> u64 {
+    now_seconds().saturating_sub(u64::try_from(time.0.timestamp()).unwrap_or(0))
+}
+
+fn writer_agreement_stale_condition(timeout_seconds: u32) -> Condition {
+    Condition {
+        type_: "WriterAgreementStale".to_owned(),
+        status: "True".to_owned(),
+        reason: "MultipleWriters".to_owned(),
+        message: format!(
+            "more than one candidate has been write-capable for over {timeout_seconds}s — expected briefly after a move, not indefinitely; check for an unhealthy or unreachable candidate"
+        ),
         observed_generation: None,
         last_transition_time: Time(chrono::Utc::now()),
     }
@@ -406,6 +962,19 @@ async fn decide_strict<S: AppScaler>(
     // call that now succeeds) always clears this the very next tick.
     upsert_condition(&mut next.conditions, "ReconcileBlocked", None);
 
+    // Computed once from the incoming status (before anything below
+    // mutates active/operation/grant), surfaced unconditionally — same
+    // "visible via kubectl get in every state" treatment IdentityChanged
+    // already gets.
+    let (node_writer_agreement, agreement_contradictions) = agreement::strict(spec, &next);
+    next.node_writer_agreement = node_writer_agreement;
+    upsert_condition(
+        &mut next.conditions,
+        "WriterLockMismatch",
+        (!agreement_contradictions.is_empty())
+            .then(|| writer_lock_mismatch_condition(&agreement_contradictions)),
+    );
+
     if let Some(operation) = &next.operation {
         if operation.target != spec.desired_active_node {
             upsert_condition(
@@ -422,7 +991,10 @@ async fn decide_strict<S: AppScaler>(
             );
             return next;
         }
-        if deadline_expired(operation) || !contradictions.is_empty() {
+        if deadline_expired(operation)
+            || !contradictions.is_empty()
+            || !agreement_contradictions.is_empty()
+        {
             let operation = next.operation.as_mut().expect("checked above");
             operation.phase = phase::DEGRADED.to_owned();
             next.grant = None;
@@ -435,10 +1007,10 @@ async fn decide_strict<S: AppScaler>(
     {
         return next;
     } else {
-        if !contradictions.is_empty() {
+        if !contradictions.is_empty() || !agreement_contradictions.is_empty() {
             // Not starting a new operation: an idle rejection has no
-            // operation to force into Degraded, but the IdentityChanged
-            // condition set by the shared caller still needs to reach
+            // operation to force into Degraded, but the IdentityChanged/
+            // WriterLockMismatch conditions set above still need to reach
             // status; see `identity_reenrollment`.
             return next;
         }
@@ -524,7 +1096,7 @@ async fn decide_strict<S: AppScaler>(
             }
         }
         phase::GRANTING => {
-            if writer_confirmed(&next, &operation.target, operation.epoch)
+            if agreement::confirmed(&next, &operation.target)
                 && all_other_candidates_standby(spec, &next, &operation.target)
             {
                 match promote_workload(scaler, spec, volume_id, &operation.target).await {
@@ -595,6 +1167,23 @@ async fn decide_best_effort<S: AppScaler>(
         &mut next.conditions,
         "Degraded",
         (!conflicts.is_empty()).then(|| sync_conflict_condition(&conflicts)),
+    );
+
+    // Computed unconditionally, same "always visible" treatment as
+    // strict's node_writer_agreement.
+    // `Pending` itself is expected and non-gating; only a `Pending` that
+    // has overstayed writerAgreementTimeoutSeconds gets a condition.
+    let agreement_entry = agreement::best_effort(spec, &next);
+    let stale_pending = agreement_entry.state == writer_agreement::PENDING
+        && seconds_since(&agreement_entry.changed_at)
+            >= u64::from(spec.storage.writer_agreement_timeout_seconds);
+    next.writer_agreement = Some(agreement_entry);
+    upsert_condition(
+        &mut next.conditions,
+        "WriterAgreementStale",
+        stale_pending.then(|| {
+            writer_agreement_stale_condition(spec.storage.writer_agreement_timeout_seconds)
+        }),
     );
 
     // A backend identity contradiction is about backend trust, not write
@@ -672,6 +1261,387 @@ mod tests {
         }
     }
 
+    /// Configurable `ClusterReader` stub — each method returns whatever was
+    /// last set via its `fail_*`/`set_*` method, defaulting to values that
+    /// let a volume with `spec`'s two ordinary candidates proceed all the
+    /// way to `decide()`. A `calls` log is also kept, for the rare test
+    /// that cares about short-circuiting itself rather than only the final
+    /// [`ReconcileOutcome`] — most tests below only need the outcome.
+    type BackendStatus = Result<(BTreeSet<String>, BTreeMap<String, u64>), String>;
+
+    struct FakeClusterReader {
+        backend_status: std::sync::Mutex<BackendStatus>,
+        owned_by_another: std::sync::Mutex<Result<bool, String>>,
+        deployment_desired_replicas: std::sync::Mutex<Result<u32, String>>,
+        ensure_replica_claims: std::sync::Mutex<Result<(), String>>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Default for FakeClusterReader {
+        fn default() -> Self {
+            Self {
+                backend_status: std::sync::Mutex::new(Ok((
+                    BTreeSet::from(["node-a".to_owned(), "node-b".to_owned()]),
+                    BTreeMap::new(),
+                ))),
+                owned_by_another: std::sync::Mutex::new(Ok(false)),
+                deployment_desired_replicas: std::sync::Mutex::new(Ok(1)),
+                ensure_replica_claims: std::sync::Mutex::new(Ok(())),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl FakeClusterReader {
+        fn fail_ensure_replica_claims(&self) {
+            *self.ensure_replica_claims.lock().unwrap() = Err("claims unavailable".to_owned());
+        }
+        fn fail_backend_status(&self) {
+            *self.backend_status.lock().unwrap() = Err("backend status unavailable".to_owned());
+        }
+        fn fail_owned_by_another(&self) {
+            *self.owned_by_another.lock().unwrap() = Err("sibling lookup unavailable".to_owned());
+        }
+        fn fail_deployment_desired_replicas(&self) {
+            *self.deployment_desired_replicas.lock().unwrap() =
+                Err("deployment unavailable".to_owned());
+        }
+        fn set_backend_status(&self, generations: BTreeMap<String, u64>) {
+            *self.backend_status.lock().unwrap() = Ok((
+                BTreeSet::from(["node-a".to_owned(), "node-b".to_owned()]),
+                generations,
+            ));
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ClusterReader for FakeClusterReader {
+        async fn backend_status_for_candidates(
+            &self,
+            _spec: &MirroredVolumeSpec,
+        ) -> Result<(BTreeSet<String>, BTreeMap<String, u64>), String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("backend_status_for_candidates");
+            self.backend_status.lock().unwrap().clone()
+        }
+
+        async fn owned_by_another_volume(
+            &self,
+            _self_name: &str,
+            _spec: &MirroredVolumeSpec,
+        ) -> Result<bool, String> {
+            self.calls.lock().unwrap().push("owned_by_another_volume");
+            self.owned_by_another.lock().unwrap().clone()
+        }
+
+        async fn deployment_desired_replicas(&self, _deployment: &str) -> Result<u32, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("deployment_desired_replicas");
+            self.deployment_desired_replicas.lock().unwrap().clone()
+        }
+
+        async fn ensure_replica_claims(
+            &self,
+            _volume_id: &str,
+            _spec: &MirroredVolumeSpec,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push("ensure_replica_claims");
+            self.ensure_replica_claims.lock().unwrap().clone()
+        }
+    }
+
+    fn annotations(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    fn degraded_status(id: u64) -> MirroredVolumeStatus {
+        MirroredVolumeStatus {
+            operation: Some(PromotionOperation {
+                id,
+                source: Some("node-a".to_owned()),
+                target: "node-b".to_owned(),
+                epoch: id,
+                phase: phase::DEGRADED.to_owned(),
+                started_at: "0".to_owned(),
+                deadline: "0".to_owned(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn no_recovery_when_not_degraded() {
+        let status = MirroredVolumeStatus::default();
+        let annotations = annotations(&[(
+            mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION,
+            "1",
+        )]);
+        assert_eq!(degraded_recovery_message(&annotations, &status), None);
+    }
+
+    #[test]
+    fn no_recovery_without_a_matching_annotation() {
+        let status = degraded_status(2);
+        assert_eq!(
+            degraded_recovery_message(&Default::default(), &status),
+            None
+        );
+    }
+
+    #[test]
+    fn no_recovery_when_the_annotation_names_a_different_stale_operation() {
+        let status = degraded_status(2);
+        let annotations = annotations(&[(
+            mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION,
+            "1",
+        )]);
+        assert_eq!(degraded_recovery_message(&annotations, &status), None);
+    }
+
+    #[test]
+    fn recovers_when_the_annotation_names_the_exact_stuck_operation() {
+        let status = degraded_status(2);
+        let annotations = annotations(&[
+            (
+                mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION,
+                "2",
+            ),
+            (
+                mirrorvol_api::naming::RECOVERY_REASON_ANNOTATION,
+                "fenced node-a via IPMI power-off",
+            ),
+        ]);
+        let message =
+            degraded_recovery_message(&annotations, &status).expect("matching operation id");
+        assert!(message.contains("operation 2"));
+        assert!(message.contains("node-b"));
+        assert!(message.contains("fenced node-a via IPMI power-off"));
+    }
+
+    #[test]
+    fn recovers_with_a_placeholder_reason_when_none_was_given() {
+        let status = degraded_status(2);
+        let annotations = annotations(&[(
+            mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION,
+            "2",
+        )]);
+        let message =
+            degraded_recovery_message(&annotations, &status).expect("matching operation id");
+        assert!(message.contains("no reason given"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_takes_the_recovery_override_without_reading_the_cluster_at_all() {
+        let status = degraded_status(2);
+        let annotations = annotations(&[(
+            mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION,
+            "2",
+        )]);
+        let reader = FakeClusterReader::default();
+        let outcome = reconcile(
+            "vol",
+            Some(1),
+            &annotations,
+            &spec("node-a"),
+            &status,
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        let next = outcome.status.expect("override always produces a status");
+        assert!(next.active.is_none());
+        assert!(next.operation.is_none());
+        assert!(next.grant.is_none());
+        assert!(next.conditions.iter().any(|c| c.type_ == "Recovered"));
+        assert_eq!(
+            outcome.clear_annotations,
+            vec![
+                mirrorvol_api::naming::RECOVER_DEGRADED_OPERATION_ANNOTATION.to_owned(),
+                mirrorvol_api::naming::RECOVERY_REASON_ANNOTATION.to_owned(),
+            ]
+        );
+        assert_eq!(outcome.requeue_after, Duration::from_secs(1));
+        // The override short-circuits before any ClusterReader call — a
+        // read failure elsewhere must never block clearing a stuck
+        // operation an operator has already externally confirmed safe.
+        assert!(reader.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconcile_takes_the_reenrollment_override_after_reading_identity_generations() {
+        let status = MirroredVolumeStatus {
+            node_identity_generations: BTreeMap::from([("node-a".to_owned(), 1)]),
+            ..Default::default()
+        };
+        let annotations = annotations(&[(
+            mirrorvol_api::naming::REENROLL_NODE_IDENTITY_ANNOTATION,
+            "node-a@2",
+        )]);
+        let reader = FakeClusterReader::default();
+        reader.set_backend_status(BTreeMap::from([("node-a".to_owned(), 2)]));
+        let outcome = reconcile(
+            "vol",
+            Some(1),
+            &annotations,
+            &spec("node-a"),
+            &status,
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        let next = outcome.status.expect("override always produces a status");
+        assert_eq!(next.node_identity_generations.get("node-a"), Some(&2));
+        assert!(next
+            .conditions
+            .iter()
+            .any(|c| c.type_ == "IdentityReenrolled"));
+        assert_eq!(outcome.requeue_after, Duration::from_secs(1));
+        // Needs this node's freshly observed generation first — unlike the
+        // recovery override, this one can't be evaluated from annotations
+        // alone.
+        assert_eq!(
+            reader.calls(),
+            vec!["ensure_replica_claims", "backend_status_for_candidates"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_stops_at_the_first_read_that_fails() {
+        let reader = FakeClusterReader::default();
+        reader.fail_ensure_replica_claims();
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_none());
+        assert!(outcome.clear_annotations.is_empty());
+        assert_eq!(outcome.requeue_after, Duration::from_secs(15));
+        assert_eq!(outcome.error.as_deref(), Some("claims unavailable"));
+        // Never reaches the second read.
+        assert_eq!(reader.calls(), vec!["ensure_replica_claims"]);
+    }
+
+    #[tokio::test]
+    async fn reconcile_surfaces_a_backend_status_read_failure() {
+        let reader = FakeClusterReader::default();
+        reader.fail_backend_status();
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_none());
+        assert_eq!(outcome.requeue_after, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn reconcile_surfaces_an_owned_by_another_read_failure() {
+        let reader = FakeClusterReader::default();
+        reader.fail_owned_by_another();
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_none());
+        assert_eq!(outcome.requeue_after, Duration::from_secs(15));
+    }
+
+    #[tokio::test]
+    async fn reconcile_surfaces_a_deployment_replicas_read_failure_only_before_adoption() {
+        let reader = FakeClusterReader::default();
+        reader.fail_deployment_desired_replicas();
+        // status.active is None here — pre-adoption, so this read actually
+        // runs. See AdmissionContext::pre_adoption_replicas.
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &MirroredVolumeStatus::default(),
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_none());
+        assert_eq!(outcome.requeue_after, Duration::from_secs(15));
+
+        // Once adopted, the same failing read is never called at all.
+        let reader = FakeClusterReader::default();
+        reader.fail_deployment_desired_replicas();
+        let adopted = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            ..Default::default()
+        };
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &adopted,
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_some());
+        assert!(!reader.calls().contains(&"deployment_desired_replicas"));
+    }
+
+    #[tokio::test]
+    async fn reconcile_reaches_decide_and_requeues_at_5s_with_no_operation_in_flight() {
+        let reader = FakeClusterReader::default();
+        let adopted = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            ..Default::default()
+        };
+        let outcome = reconcile(
+            "vol",
+            None,
+            &BTreeMap::new(),
+            &spec("node-a"),
+            &adopted,
+            &reader,
+            &FakeScaler,
+        )
+        .await;
+        assert!(outcome.status.is_some());
+        assert!(outcome.clear_annotations.is_empty());
+        assert_eq!(outcome.requeue_after, Duration::from_secs(5));
+        assert!(outcome.error.is_none());
+    }
+
     fn spec(target: &str) -> MirroredVolumeSpec {
         MirroredVolumeSpec {
             workload: WorkloadRef {
@@ -684,8 +1654,9 @@ mod tests {
                 storage_class_name: "local-path".to_owned(),
                 replica_path_template: "/data/{claim}".to_owned(),
                 claim_template: serde_json::json!({}),
-                pull_only: false,
                 ignore_patterns: vec![],
+                warm_sync_interval_seconds: 300,
+                writer_agreement_timeout_seconds: 1800,
             },
             candidate_nodes: vec!["node-a".to_owned(), "node-b".to_owned()],
             desired_active_node: target.to_owned(),
@@ -1269,6 +2240,13 @@ mod tests {
                 started_at: "0".to_owned(),
                 deadline: "9999999999".to_owned(),
             }),
+            // Confirmed-writer now requires both the live grant (below) and
+            // a matching local lock, not role/epoch alone.
+            grant: Some(PromotionGrant {
+                operation_id: 2,
+                target: "node-b".to_owned(),
+                epoch: 2,
+            }),
             nodes: std::collections::BTreeMap::from([
                 (
                     "node-a".to_owned(),
@@ -1282,6 +2260,7 @@ mod tests {
                     NodeSyncStatus {
                         role: role::WRITER.to_owned(),
                         epoch: Some(2),
+                        lock_epoch: Some(2),
                         ..Default::default()
                     },
                 ),
@@ -1858,5 +2837,444 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_source_stuck_writer_past_enforcing_standby_is_a_contradiction_not_pending() {
+        // The source's role/lock disagreement is expected during
+        // AwaitingRelease and EnforcingStandby (release_writer already ran;
+        // enforce_standby runs sometime during EnforcingStandby, not
+        // necessarily the instant that phase starts — a real async gap
+        // against a live agent, see in_flight_transition's own doc
+        // comment). If it's still Writer/lock-absent once the phase has
+        // moved on past that (here: Granting), enforce_standby didn't
+        // take — that's a stuck transition, not an in-flight one, and
+        // shouldn't wait on the full operation deadline to be noticed.
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(PromotionOperation {
+                id: 2,
+                source: Some("node-a".to_owned()),
+                target: "node-b".to_owned(),
+                epoch: 2,
+                phase: phase::GRANTING.to_owned(),
+                started_at: "0".to_owned(),
+                deadline: "9999999999".to_owned(),
+            }),
+            nodes: BTreeMap::from([
+                (
+                    "node-a".to_owned(),
+                    NodeSyncStatus {
+                        role: role::WRITER.to_owned(), // should have flipped to Standby by now
+                        released_operation: Some(2),
+                        lock_absent: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b".to_owned(),
+                    NodeSyncStatus {
+                        role: role::STANDBY.to_owned(),
+                        ready: true,
+                        release_observed_operation: Some(2),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &spec("node-b"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert_eq!(
+            next.node_writer_agreement
+                .get("node-a")
+                .map(|entry| entry.state.as_str()),
+            Some(mirrorvol_api::writer_agreement::CONTRADICTION)
+        );
+        assert_eq!(
+            next.operation
+                .as_ref()
+                .map(|operation| operation.phase.as_str()),
+            Some(phase::DEGRADED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_source_still_writer_during_enforcing_standby_is_pending_not_contradiction() {
+        // Regression for a real bug caught against a live KinD cluster: the
+        // controller can advance the phase to EnforcingStandby before the
+        // agent's own
+        // next reconcile tick has actually called enforce_standby —  an
+        // ordinary, expected async gap, not a stuck transition. An
+        // earlier, tighter version of in_flight_transition only excused
+        // this during AwaitingRelease, which forced every real promotion
+        // straight to Degraded within seconds of entering EnforcingStandby.
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(PromotionOperation {
+                id: 2,
+                source: Some("node-a".to_owned()),
+                target: "node-b".to_owned(),
+                epoch: 2,
+                phase: phase::ENFORCING_STANDBY.to_owned(),
+                started_at: "0".to_owned(),
+                deadline: "9999999999".to_owned(),
+            }),
+            nodes: BTreeMap::from([
+                (
+                    "node-a".to_owned(),
+                    NodeSyncStatus {
+                        role: role::WRITER.to_owned(), // enforce_standby hasn't landed yet
+                        released_operation: Some(2),
+                        lock_absent: true,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b".to_owned(),
+                    NodeSyncStatus {
+                        role: role::STANDBY.to_owned(),
+                        ready: true,
+                        release_observed_operation: Some(2),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &spec("node-b"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert_eq!(
+            next.node_writer_agreement
+                .get("node-a")
+                .map(|entry| entry.state.as_str()),
+            Some(mirrorvol_api::writer_agreement::PENDING)
+        );
+        // Not forced into Degraded — this is an expected, still-in-flight
+        // transition, exactly like AwaitingRelease already was.
+        assert_eq!(
+            next.operation
+                .as_ref()
+                .map(|operation| operation.phase.as_str()),
+            Some(phase::ENFORCING_STANDBY)
+        );
+    }
+
+    #[tokio::test]
+    async fn granting_does_not_commit_without_a_matching_local_lock() {
+        // The crash window this whole design closes: role already says
+        // Writer (the backend flipped it), but the local lock was never
+        // created (or doesn't match this epoch yet) — writer_confirmed
+        // must not be satisfied by role alone.
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(PromotionOperation {
+                id: 2,
+                source: Some("node-a".to_owned()),
+                target: "node-b".to_owned(),
+                epoch: 2,
+                phase: phase::GRANTING.to_owned(),
+                started_at: "0".to_owned(),
+                deadline: "9999999999".to_owned(),
+            }),
+            grant: Some(PromotionGrant {
+                operation_id: 2,
+                target: "node-b".to_owned(),
+                epoch: 2,
+            }),
+            nodes: BTreeMap::from([
+                (
+                    "node-a".to_owned(),
+                    NodeSyncStatus {
+                        role: role::STANDBY.to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b".to_owned(),
+                    NodeSyncStatus {
+                        role: role::WRITER.to_owned(),
+                        epoch: Some(2),
+                        lock_absent: true, // no lock_epoch — the crash case
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &spec("node-b"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        // Held in Granting — the grant explains the disagreement, so this
+        // is Pending, not a forced Degraded, and the promotion just hasn't
+        // committed yet.
+        assert_eq!(
+            next.operation
+                .as_ref()
+                .map(|operation| operation.phase.as_str()),
+            Some(phase::GRANTING)
+        );
+        // Never committed — active still names the old writer, node-a.
+        assert_eq!(
+            next.active.as_ref().map(|active| active.node.as_str()),
+            Some("node-a")
+        );
+        assert_eq!(
+            next.node_writer_agreement
+                .get("node-b")
+                .map(|entry| entry.state.as_str()),
+            Some(mirrorvol_api::writer_agreement::PENDING)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_contradiction_with_no_grant_forces_degraded() {
+        // Writer role claimed with a mismatched lock and nothing
+        // authorizing it — no grant, no matching active epoch.
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            operation: Some(PromotionOperation {
+                id: 2,
+                source: Some("node-a".to_owned()),
+                target: "node-b".to_owned(),
+                epoch: 2,
+                phase: phase::AWAITING_RELEASE.to_owned(),
+                started_at: "0".to_owned(),
+                deadline: "9999999999".to_owned(),
+            }),
+            nodes: BTreeMap::from([(
+                "node-c".to_owned(),
+                NodeSyncStatus {
+                    role: role::WRITER.to_owned(),
+                    lock_absent: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let mut three_candidates = spec("node-b");
+        three_candidates.candidate_nodes = vec![
+            "node-a".to_owned(),
+            "node-b".to_owned(),
+            "node-c".to_owned(),
+        ];
+        let next = decide(
+            "volume",
+            &three_candidates,
+            &status,
+            &admission(&BTreeSet::from([
+                "node-a".to_owned(),
+                "node-b".to_owned(),
+                "node-c".to_owned(),
+            ])),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert!(has_condition(
+            &next,
+            "WriterLockMismatch",
+            "LocalLockDisagreesWithRole"
+        ));
+        assert_eq!(
+            next.operation
+                .as_ref()
+                .map(|operation| operation.phase.as_str()),
+            Some(phase::DEGRADED)
+        );
+        assert!(next.grant.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_idle_contradiction_blocks_a_new_operation_from_starting() {
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            nodes: BTreeMap::from([(
+                "node-b".to_owned(),
+                NodeSyncStatus {
+                    role: role::WRITER.to_owned(), // no legitimate claim at all
+                    lock_absent: true,
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &spec("node-b"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert!(next.operation.is_none());
+        assert!(has_condition(
+            &next,
+            "WriterLockMismatch",
+            "LocalLockDisagreesWithRole"
+        ));
+    }
+
+    #[tokio::test]
+    async fn best_effort_writer_agreement_converges_at_zero_or_one_writer() {
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            nodes: BTreeMap::from([(
+                "node-a".to_owned(),
+                NodeSyncStatus {
+                    role: role::WRITER.to_owned(),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &best_effort_spec("node-a"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert_eq!(
+            next.writer_agreement.map(|entry| entry.state),
+            Some(mirrorvol_api::writer_agreement::CONVERGED.to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn best_effort_writer_agreement_is_pending_with_more_than_one_writer() {
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            nodes: BTreeMap::from([
+                (
+                    "node-a".to_owned(),
+                    NodeSyncStatus {
+                        role: role::WRITER.to_owned(),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "node-b".to_owned(),
+                    NodeSyncStatus {
+                        role: role::WRITER.to_owned(),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &best_effort_spec("node-a"),
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert_eq!(
+            next.writer_agreement
+                .as_ref()
+                .map(|entry| entry.state.as_str()),
+            Some(mirrorvol_api::writer_agreement::PENDING)
+        );
+        // Fresh Pending — not stale yet, no condition.
+        assert!(next
+            .conditions
+            .iter()
+            .all(|condition| condition.type_ != "WriterAgreementStale"));
+    }
+
+    #[tokio::test]
+    async fn best_effort_pending_only_becomes_stale_after_the_configured_timeout() {
+        let mut spec = best_effort_spec("node-a");
+        spec.storage.writer_agreement_timeout_seconds = 60;
+        let nodes = BTreeMap::from([
+            (
+                "node-a".to_owned(),
+                NodeSyncStatus {
+                    role: role::WRITER.to_owned(),
+                    ..Default::default()
+                },
+            ),
+            (
+                "node-b".to_owned(),
+                NodeSyncStatus {
+                    role: role::WRITER.to_owned(),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let status = MirroredVolumeStatus {
+            active: Some(ActiveWriter {
+                node: "node-a".to_owned(),
+                epoch: 1,
+            }),
+            nodes: nodes.clone(),
+            writer_agreement: Some(mirrorvol_api::WriterAgreementEntry {
+                state: mirrorvol_api::writer_agreement::PENDING.to_owned(),
+                // Well past the 60s timeout.
+                changed_at: Time(chrono::Utc::now() - chrono::Duration::seconds(120)),
+            }),
+            ..Default::default()
+        };
+        let next = decide(
+            "volume",
+            &spec,
+            &status,
+            &admission(&available()),
+            &no_identity_generations(),
+            &FakeScaler,
+        )
+        .await;
+        assert!(has_condition(
+            &next,
+            "WriterAgreementStale",
+            "MultipleWriters"
+        ));
     }
 }
