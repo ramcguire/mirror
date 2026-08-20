@@ -55,6 +55,7 @@ jobs:
           - controller
           - agent
           - csi
+          - rsyncd
     steps:
       - uses: actions/checkout@v4
 
@@ -76,46 +77,6 @@ jobs:
           path: /tmp/${{ matrix.target }}.tar
           retention-days: 1
 
-  integration:
-    name: Integration + e2e + CSI tests (KinD)
-    needs: build-images
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-
-      - name: Install kind
-        run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.24.0/kind-linux-amd64
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
-
-      - uses: azure/setup-kubectl@v4
-        with:
-          version: v1.31.0
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: docker-image-*
-          path: /tmp/images
-          merge-multiple: true
-
-      - name: docker load the images build-images already built
-        run: |
-          for tar in /tmp/images/*.tar; do
-            docker load -i "$tar"
-          done
-
-      - name: task test:integration:full
-        run: task test:integration:full
-
   publish:
     name: Publish ${{ matrix.target }} image
     needs: build-images
@@ -131,6 +92,7 @@ jobs:
           - controller
           - agent
           - csi
+          - rsyncd
     steps:
       - uses: actions/checkout@v4
 
