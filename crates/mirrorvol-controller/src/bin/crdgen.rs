@@ -1,5 +1,5 @@
-//! Exports both CRDs — [`MirroredVolume`] and [`BackendNode`] — as a
-//! multi-doc YAML stream, generated from the Rust structs in `mirrorvol-api`.
+//! Exports both [`MirroredVolume`] and [`BackendNode`] CRDs as a multi-doc
+//! YAML stream, generated from the structs in `mirrorvol-api`.
 //!
 //! Run via:
 //!
