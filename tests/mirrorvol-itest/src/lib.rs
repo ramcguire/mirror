@@ -112,8 +112,9 @@ pub mod fixtures {
                         "accessModes": ["ReadWriteOnce"],
                         "resources": { "requests": { "storage": "64Mi" } },
                     }),
-                    pull_only: false,
                     ignore_patterns: vec![],
+                    warm_sync_interval_seconds: 300,
+                    writer_agreement_timeout_seconds: 1800,
                 },
                 candidate_nodes: candidate_nodes.iter().map(|s| s.to_string()).collect(),
                 desired_active_node: active_node.to_string(),
@@ -264,6 +265,145 @@ impl SyncthingContainer {
 impl Drop for SyncthingContainer {
     fn drop(&mut self) {
         // Drop can't be async, and `docker rm -f` is fast enough
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+
+/// A real `rsyncd` + `stunnel` pair, run as a single Docker container.
+/// `rsyncd` binds `127.0.0.1`-only inside the container, same as
+/// production — only `tls_port` is ever published, so a test connecting
+/// straight to `rsyncd`'s port proves the tunnel is structurally the only
+/// way in.
+pub struct RsyncdContainer {
+    name: String,
+    pub tls_port: u16,
+    /// The shared module/PSK secret — same value both `--password-file`
+    /// (rsync module auth) and the `stunnel` client's PSK need, mirroring
+    /// `RSYNC_SHARED_SECRET_NAME` being one value used both ways in
+    /// production.
+    pub secret: String,
+}
+
+impl RsyncdContainer {
+    pub const MODULE: &'static str = "itest-volume";
+    pub const SEED_FILE: &'static str = "greeting.txt";
+    pub const SEED_CONTENTS: &'static str = "hello from the source node\n";
+
+    /// Starts the container with one file ([`SEED_FILE`](Self::SEED_FILE),
+    /// contents [`SEED_CONTENTS`](Self::SEED_CONTENTS)) already present
+    /// under the module's source directory, so a pull has something real
+    /// to reproduce.
+    pub async fn start() -> anyhow::Result<Self> {
+        let name = unique_name("itest-rsyncd");
+        let secret = unique_name("secret");
+
+        // One secrets file for both rsyncd's `secrets file` and stunnel's
+        // `PSKsecrets` directives — same `identity:key` format.
+        //
+        // seed_contents/secret are single-quoted shell tokens, not printf
+        // format-string escapes: printf only interprets backslashes in its
+        // format operand, never in a %s argument.
+        let script = format!(
+            "apk add --no-cache rsync stunnel; \
+             mkdir -p /data/{module}; \
+             printf '%s' '{seed_contents}' > /data/{module}/{seed_file}; \
+             printf 'mirrorvol:%s' '{secret}' > /etc/mirrorvol.secrets; \
+             chmod 600 /etc/mirrorvol.secrets; \
+             printf '[%s]\\n    path = /data/%s\\n    read only = yes\\n    \
+             auth users = mirrorvol\\n    secrets file = /etc/mirrorvol.secrets\\n' \
+             '{module}' '{module}' > /etc/rsyncd.conf; \
+             printf 'foreground = yes\\npid =\\n\\n[mirrorvol]\\naccept = 0.0.0.0:8873\\n\
+             connect = 127.0.0.1:873\\nPSKsecrets = /etc/mirrorvol.secrets\\n' > /etc/stunnel.conf; \
+             rsync --daemon --no-detach --port=873 --address=127.0.0.1 --config=/etc/rsyncd.conf & \
+             exec stunnel /etc/stunnel.conf",
+            module = Self::MODULE,
+            seed_file = Self::SEED_FILE,
+            seed_contents = Self::SEED_CONTENTS,
+            secret = secret,
+        );
+
+        let status = std::process::Command::new("docker")
+            .args([
+                "run",
+                "-d",
+                "--rm",
+                "--name",
+                &name,
+                // Only the TLS port is ever published.
+                "-p",
+                "127.0.0.1::8873",
+                "alpine:3.20",
+                "sh",
+                "-ec",
+                &script,
+            ])
+            .status()
+            .context(
+                "running `docker run` for a test rsyncd/stunnel instance — is Docker running?",
+            )?;
+        anyhow::ensure!(
+            status.success(),
+            "docker run failed for the test rsyncd/stunnel instance"
+        );
+
+        let tls_port = Self::published_port(&name)?;
+        let container = Self {
+            name,
+            tls_port,
+            secret,
+        };
+
+        // "Started" and "actually accepting TLS connections" (after `apk
+        // add` finishes and both daemons are up) are different moments.
+        let ready = wait_until(
+            Duration::from_secs(60),
+            Duration::from_millis(300),
+            || async { std::net::TcpStream::connect(("127.0.0.1", container.tls_port)).is_ok() },
+        )
+        .await;
+        anyhow::ensure!(
+            ready,
+            "test rsyncd/stunnel instance never became reachable on port {}",
+            container.tls_port
+        );
+
+        Ok(container)
+    }
+
+    fn published_port(name: &str) -> anyhow::Result<u16> {
+        let output = std::process::Command::new("docker")
+            .args(["port", name, "8873/tcp"])
+            .output()
+            .context("running `docker port`")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "docker port failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout)?;
+        text.trim()
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .ok_or_else(|| anyhow::anyhow!("couldn't parse `docker port` output: {text:?}"))
+    }
+
+    /// Whether `docker port` has *any* mapping for `port` — used to assert
+    /// `rsyncd`'s own port was never published at all, not merely that
+    /// connecting to it fails for some other reason.
+    pub fn has_published_port(&self, port: u16) -> bool {
+        std::process::Command::new("docker")
+            .args(["port", &self.name, &format!("{port}/tcp")])
+            .output()
+            .map(|output| output.status.success() && !output.stdout.is_empty())
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for RsyncdContainer {
+    fn drop(&mut self) {
         let _ = std::process::Command::new("docker")
             .args(["rm", "-f", &self.name])
             .output();
