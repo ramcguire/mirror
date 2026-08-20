@@ -3,11 +3,15 @@
 //! own submodule implementing [`LocalBackend`]; adding a backend means
 //! adding a module, not touching this one.
 
+pub mod lockfile;
+pub mod rsync;
 pub mod syncthing;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,7 +35,7 @@ pub trait CompletionStatus: Send + Sync {
 }
 
 /// Declarative configuration for this agent's local replica only.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReplicaConfig {
     pub volume_id: String,
     pub local_path: String,
@@ -43,6 +47,19 @@ pub struct ReplicaConfig {
     pub generation: u64,
     /// Gitignore-style patterns this replica should never sync.
     pub ignore_patterns: Vec<String>,
+    /// This volume's current active/writer node's address, if known —
+    /// only meaningful to a directional, pull-based backend (`rsync`),
+    /// which needs to know who to pull *from*; ignored by peer-to-peer
+    /// backends like Syncthing. Deliberately excluded from whatever hash a
+    /// caller derives `generation` from: unlike the peer/path fields
+    /// above, an active-node change alone shouldn't force a backend's
+    /// expensive one-time replica setup to re-run, only refresh which
+    /// address a pull-based backend's next sync targets. `ensure_replica`
+    /// is called unconditionally on every reconcile (see
+    /// `mirrorvol-agent::reconcile_local`), so a pull-based backend can
+    /// refresh this every tick even while short-circuiting the rest of its
+    /// own setup on an unchanged `generation`.
+    pub active_peer_address: Option<String>,
 }
 
 /// Immutable controller operation passed to one local backend.
@@ -55,13 +72,16 @@ pub struct WriterOperation {
 
 /// Backend API deliberately has no remote-node parameter. A process holding
 /// this trait cannot administer another node's backend instance.
+///
+/// Object-safe by design (no associated type on `completion`'s return) —
+/// one agent process holds a `HashMap<&str, Box<dyn LocalBackend>>` keyed
+/// by backend name so a single node can reconcile volumes across more than
+/// one backend without being monomorphized to exactly one at compile time.
 #[async_trait]
 pub trait LocalBackend: Send + Sync {
-    type Completion: CompletionStatus + std::fmt::Debug;
-
     async fn ensure_replica(&self, config: &ReplicaConfig) -> Result<(), BackendError>;
     async fn is_writer(&self, volume_id: &str) -> Result<bool, BackendError>;
-    async fn completion(&self, volume_id: &str) -> Result<Self::Completion, BackendError>;
+    async fn completion(&self, volume_id: &str) -> Result<Box<dyn CompletionStatus>, BackendError>;
     async fn lock_state(&self, volume_id: &str) -> Result<LockState, BackendError>;
 
     /// Enables only this node's writer role and atomically records the epoch.
@@ -102,6 +122,28 @@ pub trait LocalBackend: Send + Sync {
         volume_id: &str,
         patterns: &[String],
     ) -> Result<(), BackendError>;
+
+    /// Starts (or is a no-op for) whatever background work this backend
+    /// needs outside the ordinary reconcile call sequence — `rsync`'s
+    /// periodic warm sync being the only real implementation today. Safe to
+    /// call every reconcile: an implementation is responsible for making a
+    /// repeat call for the same `volume_id` a no-op.
+    ///
+    /// `self: Arc<Self>`, not `&self`: starting genuinely background work
+    /// (a spawned task outliving this call) needs an owned handle that
+    /// outlives the call, which `&self` structurally can't provide without
+    /// the implementing type holding a self-referential `Weak<Self>`. Every
+    /// caller already holds an `Arc<dyn LocalBackend>` (the registry this
+    /// trait exists to support — see this trait's own doc comment), so this
+    /// costs callers nothing beyond a refcount bump. Object-safe: `Arc<Self>`
+    /// is one of the receiver types `dyn LocalBackend` can dispatch through.
+    ///
+    /// Defaults to a no-op — most backends have no background work to
+    /// start, the same "meaningful for one backend, near-no-op for the
+    /// rest" shape [`enforce_standby`](Self::enforce_standby)/
+    /// [`enable_send_receive`](Self::enable_send_receive) already have for
+    /// `rsync` specifically.
+    fn start_background_tasks(self: Arc<Self>, _volume_id: String, _interval: Duration) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,8 +225,6 @@ impl FakeBackend {
 
 #[async_trait]
 impl LocalBackend for FakeBackend {
-    type Completion = FakeCompletion;
-
     async fn ensure_replica(&self, config: &ReplicaConfig) -> Result<(), BackendError> {
         self.calls.lock().push(Call::EnsureReplica {
             volume_id: config.volume_id.clone(),
@@ -205,13 +245,14 @@ impl LocalBackend for FakeBackend {
             .unwrap_or(false))
     }
 
-    async fn completion(&self, volume_id: &str) -> Result<Self::Completion, BackendError> {
-        Ok(self
-            .completion
-            .lock()
-            .get(volume_id)
-            .copied()
-            .unwrap_or(FakeCompletion { ready: false }))
+    async fn completion(&self, volume_id: &str) -> Result<Box<dyn CompletionStatus>, BackendError> {
+        Ok(Box::new(
+            self.completion
+                .lock()
+                .get(volume_id)
+                .copied()
+                .unwrap_or(FakeCompletion { ready: false }),
+        ))
     }
 
     async fn lock_state(&self, volume_id: &str) -> Result<LockState, BackendError> {

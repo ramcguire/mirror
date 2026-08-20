@@ -9,11 +9,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::lockfile::{self, RoleSetter};
 use crate::{
     BackendError, CompletionStatus, LocalBackend, LockState, ReplicaConfig, WriterOperation,
 };
-
-const LOCK_FILE_NAME: &str = ".mirror-lock";
 
 /// Env var *names* for reaching this node's own sibling Syncthing instance
 /// — read by both mirrorvol-agent's reconcile loop and mirrorvol-csi's
@@ -54,11 +53,6 @@ pub enum SyncthingError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("invalid writer lock at {path}: {source}")]
-    LockDecode {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
     #[error("neither {env_var} nor {file_env_var} is set")]
     MissingApiKey {
         env_var: String,
@@ -77,6 +71,21 @@ impl From<SyncthingError> for BackendError {
 pub struct LocalEndpoint {
     pub base_url: String,
     pub api_key: String,
+}
+
+impl LocalEndpoint {
+    /// Reads [`env::SYNCTHING_BASE_URL`] (falling back to
+    /// [`env::SYNCTHING_BASE_URL_DEFAULT`]) and the API key via
+    /// [`api_key_from_env`] with [`env::SYNCTHING_API_KEY`]/
+    /// [`env::SYNCTHING_API_KEY_FILE`] — the exact env-var reads
+    /// `mirrorvol-agent`'s long-lived registry and `mirrorvol-csi`'s
+    /// per-RPC client both need, previously hand-copied in both crates.
+    pub fn from_env() -> Result<Self, SyncthingError> {
+        let base_url = std::env::var(env::SYNCTHING_BASE_URL)
+            .unwrap_or_else(|_| env::SYNCTHING_BASE_URL_DEFAULT.to_owned());
+        let api_key = api_key_from_env(env::SYNCTHING_API_KEY, env::SYNCTHING_API_KEY_FILE)?;
+        Ok(Self { base_url, api_key })
+    }
 }
 
 /// Reads the Syncthing API key from `env_var`, or failing that, from the
@@ -126,17 +135,6 @@ pub async fn fetch_device_id(
         .await
         .map_err(|source| SyncthingError::Http { url, source })
         .map(|status: Status| status.my_id)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct WriterLock {
-    #[serde(rename = "volumeID")]
-    volume_id: String,
-    #[serde(rename = "writerNode")]
-    writer_node: String,
-    epoch: u64,
-    #[serde(rename = "operationID")]
-    operation_id: u64,
 }
 
 /// Which [`conflict_files`](crate::LocalBackend::conflict_files)
@@ -197,6 +195,27 @@ impl SyncthingBackend {
 
     pub fn with_conflict_detection(mut self, mode: ConflictDetection) -> Self {
         self.conflict_detection = mode;
+        self
+    }
+
+    /// Registers `volume_id`'s real local replica directory directly, in
+    /// memory only — no network call, unlike [`LocalBackend::ensure_replica`].
+    /// [`replica_dir`](Self::replica_dir) (what [`lock_state`](Self::lock_state)
+    /// and [`acquire_writer`](Self::acquire_writer) actually check) falls
+    /// back to `data_root.join(volume_id)` when nothing's configured yet —
+    /// a placeholder that only happens to be correct for `data_root`'s own
+    /// caller (`mirrorvol-agent`, which always calls `ensure_replica`
+    /// before any of those checks anyway) and is never right for a bare
+    /// `volume_id` alone, which carries no per-node/per-resolved-path
+    /// disambiguation. `mirrorvol-csi`'s attach-time verification
+    /// deliberately never calls `ensure_replica` (that performs real
+    /// Syncthing folder registration, a `mirrorvol-agent`-only side
+    /// effect) but still needs `replica_dir` to resolve correctly — this
+    /// is that path, without the network I/O.
+    pub fn with_known_replica_path(self, volume_id: &str, path: impl Into<PathBuf>) -> Self {
+        self.configured
+            .lock()
+            .insert(volume_id.to_owned(), (0, path.into()));
         self
     }
 
@@ -278,10 +297,6 @@ impl SyncthingBackend {
             .get(volume_id)
             .map(|(_generation, path)| path.clone())
             .unwrap_or_else(|| self.data_root.join(volume_id))
-    }
-
-    fn lock_path(&self, volume_id: &str) -> PathBuf {
-        self.replica_dir(volume_id).join(LOCK_FILE_NAME)
     }
 
     async fn patch_folder_type(
@@ -471,9 +486,18 @@ impl SyncthingBackend {
 }
 
 #[async_trait]
-impl LocalBackend for SyncthingBackend {
-    type Completion = SyncthingCompletion;
+impl RoleSetter for SyncthingBackend {
+    async fn set_writer_role(&self, volume_id: &str, writer: bool) -> Result<(), BackendError> {
+        self.patch_folder_type(
+            volume_id,
+            if writer { "sendreceive" } else { "receiveonly" },
+        )
+        .await
+    }
+}
 
+#[async_trait]
+impl LocalBackend for SyncthingBackend {
     async fn ensure_replica(&self, config: &ReplicaConfig) -> Result<(), BackendError> {
         if self
             .configured
@@ -574,7 +598,7 @@ impl LocalBackend for SyncthingBackend {
         Ok(folder.folder_type == "sendreceive")
     }
 
-    async fn completion(&self, volume_id: &str) -> Result<Self::Completion, BackendError> {
+    async fn completion(&self, volume_id: &str) -> Result<Box<dyn CompletionStatus>, BackendError> {
         // Omitting `device` asks Syncthing for this local replica's completion.
         let url = format!(
             "{}/rest/db/completion?folder={volume_id}",
@@ -590,32 +614,17 @@ impl LocalBackend for SyncthingBackend {
                 url: url.clone(),
                 source,
             })?;
-        check_status(response, url.clone())
+        let completion: SyncthingCompletion = check_status(response, url.clone())
             .await
             .map_err(BackendError::from)?
             .json()
             .await
-            .map_err(|source| SyncthingError::Http { url, source }.into())
+            .map_err(|source| SyncthingError::Http { url, source })?;
+        Ok(Box::new(completion))
     }
 
     async fn lock_state(&self, volume_id: &str) -> Result<LockState, BackendError> {
-        let path = self.lock_path(volume_id);
-        match tokio::fs::read(&path).await {
-            Ok(contents) => {
-                let lock = serde_json::from_slice::<WriterLock>(&contents)
-                    .map_err(|source| SyncthingError::LockDecode { path, source })?;
-                if lock.volume_id != volume_id {
-                    return Err(BackendError::Request(
-                        "writer lock belongs to another volume".to_owned(),
-                    ));
-                }
-                Ok(LockState::Present {
-                    epoch: Some(lock.epoch),
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(LockState::Absent),
-            Err(source) => Err(SyncthingError::Io { path, source }.into()),
-        }
+        lockfile::lock_state(&self.replica_dir(volume_id), volume_id).await
     }
 
     async fn acquire_writer(
@@ -623,60 +632,11 @@ impl LocalBackend for SyncthingBackend {
         volume_id: &str,
         operation: &WriterOperation,
     ) -> Result<(), BackendError> {
-        if !matches!(self.lock_state(volume_id).await?, LockState::Absent) {
-            return Err(BackendError::LockPresent);
-        }
-        self.patch_folder_type(volume_id, "sendreceive").await?;
-        let path = self.lock_path(volume_id);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|source| SyncthingError::Io {
-                    path: parent.to_owned(),
-                    source,
-                })?;
-        }
-        let lock = WriterLock {
-            volume_id: volume_id.to_owned(),
-            writer_node: operation.writer_node.clone(),
-            epoch: operation.epoch,
-            operation_id: operation.operation_id,
-        };
-        let contents = serde_json::to_vec(&lock).expect("WriterLock serialization is infallible");
-        match tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .await
-        {
-            Ok(mut file) => {
-                use tokio::io::AsyncWriteExt;
-                file.write_all(&contents)
-                    .await
-                    .map_err(|source| SyncthingError::Io { path, source })?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                self.enforce_standby(volume_id).await?;
-                Err(BackendError::LockPresent)
-            }
-            Err(source) => {
-                self.enforce_standby(volume_id).await?;
-                Err(SyncthingError::Io { path, source }.into())
-            }
-        }
+        lockfile::acquire_writer(self, &self.replica_dir(volume_id), volume_id, operation).await
     }
 
     async fn restore_writer(&self, volume_id: &str, epoch: u64) -> Result<(), BackendError> {
-        if !matches!(
-            self.lock_state(volume_id).await?,
-            LockState::Present {
-                epoch: Some(lock_epoch)
-            } if lock_epoch == epoch
-        ) {
-            return Err(BackendError::LockPresent);
-        }
-        self.patch_folder_type(volume_id, "sendreceive").await
+        lockfile::restore_writer(self, &self.replica_dir(volume_id), volume_id, epoch).await
     }
 
     async fn release_writer(
@@ -684,20 +644,15 @@ impl LocalBackend for SyncthingBackend {
         volume_id: &str,
         _operation: &WriterOperation,
     ) -> Result<(), BackendError> {
-        let path = self.lock_path(volume_id);
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(source) => Err(SyncthingError::Io { path, source }.into()),
-        }
+        lockfile::remove_lock(&self.replica_dir(volume_id)).await
     }
 
     async fn enforce_standby(&self, volume_id: &str) -> Result<(), BackendError> {
-        self.patch_folder_type(volume_id, "receiveonly").await
+        self.set_writer_role(volume_id, false).await
     }
 
     async fn enable_send_receive(&self, volume_id: &str) -> Result<(), BackendError> {
-        self.patch_folder_type(volume_id, "sendreceive").await
+        self.set_writer_role(volume_id, true).await
     }
 
     async fn conflict_files(&self, volume_id: &str) -> Result<Vec<String>, BackendError> {
@@ -860,6 +815,7 @@ mod tests {
                 peer_addresses: std::collections::BTreeMap::new(),
                 generation: 1,
                 ignore_patterns: vec![],
+                active_peer_address: None,
             })
             .await
             .expect("ensure_replica");
@@ -911,6 +867,7 @@ mod tests {
                 )]),
                 generation: 1,
                 ignore_patterns: vec![],
+                active_peer_address: None,
             })
             .await
             .expect("ensure_replica");
@@ -1191,6 +1148,7 @@ mod tests {
                 peer_addresses: std::collections::BTreeMap::new(),
                 generation: 1,
                 ignore_patterns: vec![],
+                active_peer_address: None,
             })
             .await
             .expect("ensure_replica");
